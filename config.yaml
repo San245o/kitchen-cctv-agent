@@ -1,0 +1,38 @@
+runtime:
+  device: auto
+  seed: 0
+  video_backend: opencv
+
+models:
+  detector:
+    weights: yolo26s.pt
+    conf: 0.25
+    iou: 0.45
+    imgsz: 960
+  vlm:
+    primary: Qwen/Qwen3-VL-4B-Instruct
+    alternate: nvidia/Cosmos-Reason2-2B
+    max_new_tokens: 256
+    max_frames_per_call: 4
+
+budgets:
+  frames_per_video_hour: 1450
+  coarse_fraction: 0.72
+  wall_clock_minutes: 24
+  cost_usd_per_local_call: 0.0
+
+sampling:
+  coarse_stride_seconds: 3.0
+  fine_stride_seconds: 1.0
+  micro_stride_seconds: 0.5
+
+thresholds:
+  consensus_of: 3
+  consensus_min_agree: 2
+  min_answer_confidence: 0.55
+  not_visible_confidence: 0.5
+  candidate_top_k: 12
+  refine_max_steps: 6
+
+zones:
+  margin: 0.06

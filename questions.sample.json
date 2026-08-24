@@ -1,0 +1,38 @@
+[
+  {
+    "id": "q001",
+    "video_id": "sample_01",
+    "type": "timestamp",
+    "question": "At what timestamp was the first sealed bag placed on the handoff shelf?"
+  },
+  {
+    "id": "q002",
+    "video_id": "sample_01",
+    "type": "yes_no",
+    "question": "Was the cook at the stove wearing a cap or hairnet at 00:45?"
+  },
+  {
+    "id": "q003",
+    "video_id": "sample_01",
+    "type": "count",
+    "question": "How many people were active at the prep counter at 00:45?"
+  },
+  {
+    "id": "q004",
+    "video_id": "sample_01",
+    "type": "yes_no",
+    "question": "Did the worker close the container before moving it away from the station?"
+  },
+  {
+    "id": "q005",
+    "video_id": "sample_01",
+    "type": "multiple_choice",
+    "question": "Which happened last: garnish added, lid closed, bag moved, or tray wiped?"
+  },
+  {
+    "id": "q006",
+    "video_id": "sample_01",
+    "type": "ocr",
+    "question": "Is the order number visible? Answer not_visible if it is not readable."
+  }
+]
