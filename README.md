@@ -91,7 +91,15 @@ First run downloads weights automatically: `yolo26s.pt` (~20MB) and
 ## Determinism
 
 Fixed sampling grid, greedy decoding (`do_sample=False`), seeded RNG
-(`runtime.seed`). Re-runs on identical inputs produce identical outputs.
+(`runtime.seed`). Outputs are reproducible given the same hardware and the same
+wall-clock headroom; if a slow machine exhausts the global time budget mid-run,
+later questions degrade to `not_visible` and this is visible in `run_log.json`.
+
+## Performance notes
+
+- Pre-fetch weights outside timed runs: `python answer.py --videos x --questions x --out x --log x --download-only`
+- 8GB VRAM: run the VLM quantized (GGUF Q4_K_M ~2.7GB or AWQ INT4 ~3GB); bf16 4B does not fit.
+- Global budget guards: wall clock (all videos combined), total frames, and a hard VLM-call cap (`budgets.max_model_calls`).
 
 ## Bench models (promotion triggers)
 

@@ -40,6 +40,11 @@ class VLM:
         "If no text is clearly readable, reply exactly: NOT_READABLE.\n"
         "Reply with the text only."
     )
+    READ_TARGETED_PROMPT = (
+        "Look at this kitchen camera frame. Question about on-screen text: {q}\n"
+        "If the requested text is clearly readable, reply with just the text.\n"
+        "If it is not visible or not readable, reply exactly: NOT_READABLE."
+    )
     LOCATE_PROMPT = (
         "Locate the {phrase} in this image. "
         'Reply with JSON only: {{"box_2d": [ymin, xmin, ymax, xmax]}} '
@@ -56,6 +61,9 @@ class VLM:
         self.available = False
         self.load_error = None
         self._attempted = False
+
+    def set_budget(self, budget):
+        self.budget = budget
 
     def use_alternate(self):
         self.cfg["primary"], self.cfg["alternate"] = self.cfg["alternate"], self.cfg["primary"]
@@ -94,6 +102,19 @@ class VLM:
             return None
         if not self.ensure_loaded():
             return None
+        import concurrent.futures
+
+        timeout_s = float(self.cfg.get("call_timeout_seconds", 180))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(self._generate_inner, images, prompt)
+            try:
+                return fut.result(timeout=timeout_s)
+            except concurrent.futures.TimeoutError:
+                self.budget.log_call(self.model_id, "vlm_timeout")
+                fut.cancel()
+                return None
+
+    def _generate_inner(self, images, prompt: str):
         try:
             import torch
 
@@ -126,12 +147,17 @@ class VLM:
 
     def read_text(self, img):
         resp = self._generate([img], self.READ_PROMPT)
-        if not resp:
-            return None, 0.0
-        if "NOT_READABLE" in resp.upper() or len(resp.strip()) < 2:
-            return None, 0.3
-        clean = resp.strip().strip('"')
-        return clean, 0.75
+        return parse_text_response(resp)
+
+    def read_targeted(self, img, question: str):
+        resp = self._generate([img], self.READ_TARGETED_PROMPT.format(q=question))
+        text, conf = parse_text_response(resp)
+        if text is None:
+            return None, None, 0.3
+        visible, vconf = self.yes_no(img, f"Is this the requested information clearly readable in the image: '{text}'?")
+        if visible == "yes":
+            return True, text, max(conf, 0.7) * 0.9 + vconf * 0.1
+        return None, None, 0.4
 
     def locate(self, img, phrase: str):
         h, w = img.shape[:2]
@@ -174,6 +200,15 @@ def parse_yes_no(resp):
     if "NO" in resp.upper():
         return "no", 0.6
     return None, 0.3
+
+
+def parse_text_response(resp):
+    if not resp:
+        return None, 0.0
+    if "NOT_READABLE" in resp.upper() or len(resp.strip()) < 2:
+        return None, 0.3
+    clean = resp.strip().strip('"')
+    return clean, 0.75
 
 
 def consensus(votes, min_agree=2):

@@ -19,6 +19,7 @@ budgets:
   frames_per_video_hour: 1450
   coarse_fraction: 0.72
   wall_clock_minutes: 24
+  max_model_calls: 380
   cost_usd_per_local_call: 0.0
 
 sampling:

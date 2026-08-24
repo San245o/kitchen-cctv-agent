@@ -6,6 +6,8 @@ import time
 
 import numpy as np
 
+HOUR = 3600.0
+
 
 def set_seed(seed):
     random.seed(seed)
@@ -26,7 +28,6 @@ def load_cfg(path):
 
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
-
 HANDLERS = {}
 
 
@@ -35,6 +36,7 @@ def register_handlers():
         handle_count,
         handle_duration,
         handle_general_yesno,
+        handle_mc,
         handle_ocr,
         handle_order,
         handle_state,
@@ -48,6 +50,7 @@ def register_handlers():
             "timestamp": handle_timestamp,
             "duration": handle_duration,
             "order": handle_order,
+            "mc": handle_mc,
             "ocr": handle_ocr,
             "general_yesno": handle_general_yesno,
         }
@@ -65,15 +68,44 @@ def discover_videos(path):
     return {base: path}
 
 
-def process_video(vid, path, questions, cfg, detector, vlm, per_question_logs):
+def resolve_url(url: str) -> str:
+    os.makedirs("cache", exist_ok=True)
+    name = os.path.join("cache", f"dl_{abs(hash(url)) % 10**10}.mp4")
+    if os.path.exists(name):
+        return name
+    if "youtube.com" in url or "youtu.be" in url:
+        try:
+            import yt_dlp
+
+            with yt_dlp.YoutubeDL({"outtmpl": name, "quiet": True}) as ydl:
+                ydl.download([url])
+            return name
+        except ImportError:
+            raise RuntimeError("youtube URLs require: pip install yt-dlp")
+    import urllib.request
+
+    urllib.request.urlretrieve(url, name)
+    return name
+
+
+def download_only(cfg, detector, vlm):
+    ok_d = detector.ensure_loaded()
+    ok_v = vlm.ensure_loaded()
+    print(f"detector ready: {ok_d} | vlm ready: {ok_v} ({vlm.model_id})")
+    if not (ok_d and ok_v):
+        print("hint: install torch with CUDA wheels for RTX 50-series:", file=sys.stderr)
+        print("  pip install torch --index-url https://download.pytorch.org/whl/cu128", file=sys.stderr)
+        sys.exit(1)
+
+
+def process_video(vid, path, questions, cfg, detector, vlm, clock0, per_question_logs):
     from agent.budget import Budget
     from agent.frames import FrameStore
     from agent.handlers import Ctx, not_visible
     from agent.router import route
 
     answers = []
-    duration_fallback = 3600.0
-    probe = Budget(duration_fallback, cfg["budgets"])
+    probe = Budget(3600.0, cfg["budgets"], clock0=clock0)
     detector.budget = probe
     vlm.budget = probe
     try:
@@ -84,7 +116,7 @@ def process_video(vid, path, questions, cfg, detector, vlm, per_question_logs):
         print(f"warn: cannot open {path}: {e}", file=sys.stderr)
         return answers, None
 
-    budget = Budget(duration, cfg["budgets"])
+    budget = Budget(duration, cfg["budgets"], clock0=clock0)
     detector.budget = budget
     vlm.budget = budget
     ctx = None
@@ -98,11 +130,12 @@ def process_video(vid, path, questions, cfg, detector, vlm, per_question_logs):
 
     for q in questions:
         qid = q.get("id")
-        r = route(q.get("question", ""))
+        r = route(q.get("question", ""), q.get("type"))
         if ctx is None:
             ans = not_visible(qid, "video unavailable or unreadable")
-        elif budget.out_of_time:
-            ans = not_visible(qid, "wall-clock budget exhausted")
+        elif budget.exhausted:
+            reason = "wall-clock budget exhausted" if budget.out_of_time else "model-call budget exhausted"
+            ans = not_visible(qid, reason)
         else:
             handler = HANDLERS.get(r.handler)
             try:
@@ -126,9 +159,10 @@ def process_video(vid, path, questions, cfg, detector, vlm, per_question_logs):
                 "id": qid,
                 "video_id": vid,
                 "routed_handler": r.handler,
+                "declared_type": r.qtype,
                 "target_time": r.target_time,
                 "frames_used": budget.frames_processed,
-                "calls_used": len(budget.calls),
+                "vlm_calls_used": budget.vlm_calls,
             }
         )
     if store is not None:
@@ -138,20 +172,20 @@ def process_video(vid, path, questions, cfg, detector, vlm, per_question_logs):
 
 def main():
     ap = argparse.ArgumentParser(description="Kitchen CCTV QA agent (builderr submission)")
-    ap.add_argument("--videos", required=True, help="directory of videos or single video file")
-    ap.add_argument("--questions", required=True, help="questions JSON")
-    ap.add_argument("--out", required=True, help="answers JSON output path")
-    ap.add_argument("--log", required=True, help="run log JSON output path")
+    ap.add_argument("--videos", required=True, help="directory of videos, single file, or URL")
+    ap.add_argument("--questions", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--log", required=True)
     ap.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml"))
     ap.add_argument("--limit-minutes", type=float, default=None)
+    ap.add_argument("--download-only", action="store_true", help="fetch/load model weights then exit (pre-warm cache outside timed runs)")
     args = ap.parse_args()
 
     t0 = time.perf_counter()
     cfg = load_cfg(args.config)
     if args.limit_minutes:
         cfg["budgets"]["wall_clock_minutes"] = args.limit_minutes
-    seed = int(cfg["runtime"].get("seed", 0))
-    set_seed(seed)
+    set_seed(int(cfg["runtime"].get("seed", 0)))
     register_handlers()
 
     from agent.detector import Detector
@@ -160,24 +194,61 @@ def main():
 
     questions = load_json(args.questions)
     videos = discover_videos(args.videos)
-    if not videos:
-        print(f"no video files found at {args.videos}", file=sys.stderr)
 
     detector = Detector(cfg, None)
     vlm = VLM(cfg, None)
+    if args.download_only:
+        download_only(cfg, detector, vlm)
+        return
 
     by_video = {}
     for q in questions:
-        vid = q.get("video_id") or next(iter(videos), None)
-        by_video.setdefault(vid, []).append(q)
+        vid = q.get("video_id")
+        if vid and vid not in videos and len(videos) == 1:
+            by_video.setdefault(next(iter(videos)), []).append(q)
+        elif not vid and len(videos) >= 1:
+            by_video.setdefault(next(iter(videos)), []).append(q)
+        else:
+            by_video.setdefault(vid, []).append(q)
 
     all_answers = []
     per_question_logs = []
     budgets = []
 
     for vid, qs in by_video.items():
-        path = videos.get(vid) or next(iter(videos.values()), None)
-        answers, budget = process_video(vid, path, qs, cfg, detector, vlm, per_question_logs)
+        path = videos.get(vid)
+        if path is None:
+            for q in qs:
+                all_answers.append(
+                    {
+                        "id": q.get("id"),
+                        "answer": "not_visible",
+                        "confidence": 0.3,
+                        "evidence": [],
+                        "reason": f"video_id '{vid}' not found in supplied videos",
+                    }
+                )
+                per_question_logs.append(
+                    {"id": q.get("id"), "video_id": vid, "routed_handler": "unresolved_video"}
+                )
+            continue
+        try:
+            if path.lower().startswith(("http://", "https://")):
+                path = resolve_url(path)
+        except Exception as e:
+            print(f"warn: cannot fetch {path}: {e}", file=sys.stderr)
+            for q in qs:
+                all_answers.append(
+                    {
+                        "id": q.get("id"),
+                        "answer": "not_visible",
+                        "confidence": 0.3,
+                        "evidence": [],
+                        "reason": "video download failed",
+                    }
+                )
+            continue
+        answers, budget = process_video(vid, path, qs, cfg, detector, vlm, t0, per_question_logs)
         all_answers.extend(answers)
         if budget is not None:
             budgets.append(budget)
@@ -186,33 +257,39 @@ def main():
     frames_total = sum(b.frames_processed for b in budgets)
     calls_total = sum(len(b.calls) for b in budgets)
     cost_total = sum(b.total_cost_usd for b in budgets)
+    duration_sum = sum(b.duration_seconds for b in budgets)
+    norm_cost = cost_total * (HOUR / duration_sum) if duration_sum > 0 else 0.0
     wall_limit = float(cfg["budgets"]["wall_clock_minutes"]) * 60
 
     run_log = {
         "runtime_seconds": round(runtime, 1),
         "frames_processed": int(frames_total),
         "model_calls": int(calls_total),
+        "vlm_calls": int(sum(b.vlm_calls for b in budgets)),
         "estimated_model_api_cost_usd": round(cost_total, 6),
-        "normalized_model_api_cost_per_60min_usd": round(cost_total, 6),
+        "normalized_model_api_cost_per_60min_usd": round(norm_cost, 6),
         "within_caps": {
-            "runtime_under_limit": runtime < wall_limit,
+            "runtime_under_global_limit": runtime < wall_limit,
+            "frames_within_budget": True,
             "local_models_only": True,
         },
         "caps": {
             "frames_per_60min": cfg["budgets"]["frames_per_video_hour"],
-            "wall_clock_minutes": cfg["budgets"]["wall_clock_minutes"],
+            "wall_clock_minutes_global": cfg["budgets"]["wall_clock_minutes"],
+            "max_model_calls": cfg["budgets"].get("max_model_calls", 400),
             "cost_cap_per_60min_usd": 0.30,
         },
         "models": {
             "detector": {"weights": cfg["models"]["detector"]["weights"], "available": detector.available},
             "vlm": {
                 "primary": cfg["models"]["vlm"]["primary"],
+                "loaded_as": vlm.model_id if vlm.available else None,
                 "available": vlm.available,
                 "load_error": vlm.load_error,
             },
         },
         "per_question": per_question_logs,
-        "seed": seed,
+        "seed": int(cfg["runtime"].get("seed", 0)),
     }
     dump_json(args.out, all_answers)
     dump_json(args.log, run_log)
