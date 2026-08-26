@@ -28,7 +28,18 @@ def load_cfg(path):
 
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
+CACHE_DIRS = []
 HANDLERS = {}
+
+
+def cleanup_cache():
+    import shutil
+
+    if os.environ.get("KEEP_CACHE") == "1":
+        print(f"keeping cache dirs: {CACHE_DIRS}")
+        return
+    for d in CACHE_DIRS:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 def register_handlers():
@@ -159,6 +170,7 @@ def process_video(vid, path, questions, cfg, detector, vlm, clock0, per_question
     store = None
     try:
         store = FrameStore(path, budget, cfg["sampling"])
+        CACHE_DIRS.append(store.cache_dir)
         store.build_coarse()
         ctx = Ctx(vid, store, detector, vlm, budget, cfg)
     except Exception as e:
@@ -224,6 +236,8 @@ def main():
         raise
     except Exception as e:
         emergency_dump(args.out, args.log, state["questions"], e)
+    finally:
+        cleanup_cache()
 
 
 def run(args, state):
