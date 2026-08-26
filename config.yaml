@@ -12,8 +12,11 @@ models:
   vlm:
     primary: Qwen/Qwen3-VL-4B-Instruct
     alternate: nvidia/Cosmos-Reason2-2B
+    fallbacks:
+      - Qwen/Qwen3-VL-2B-Instruct
     max_new_tokens: 256
     max_frames_per_call: 4
+    call_timeout_seconds: 180
 
 budgets:
   frames_per_video_hour: 1450

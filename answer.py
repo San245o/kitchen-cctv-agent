@@ -92,10 +92,46 @@ def download_only(cfg, detector, vlm):
     ok_d = detector.ensure_loaded()
     ok_v = vlm.ensure_loaded()
     print(f"detector ready: {ok_d} | vlm ready: {ok_v} ({vlm.model_id})")
-    if not (ok_d and ok_v):
-        print("hint: install torch with CUDA wheels for RTX 50-series:", file=sys.stderr)
-        print("  pip install torch --index-url https://download.pytorch.org/whl/cu128", file=sys.stderr)
+    if vlm.load_error:
+        print("load errors:", vlm.load_error, file=sys.stderr)
+    if not ok_v:
+        print(
+            "warning: no VLM available; runs will degrade to not_visible answers.\n"
+            "hint for RTX 50-series: pip install torch --index-url https://download.pytorch.org/whl/cu128",
+            file=sys.stderr,
+        )
         sys.exit(1)
+
+
+def emergency_dump(out_path, log_path, questions, error):
+    import json
+
+    answers = [
+        {
+            "id": q.get("id"),
+            "answer": "not_visible",
+            "confidence": 0.3,
+            "evidence": [],
+            "reason": f"agent failed to initialize: {error}",
+        }
+        for q in (questions or [])
+    ]
+    log = {
+        "runtime_seconds": 0.0,
+        "frames_processed": 0,
+        "model_calls": 0,
+        "estimated_model_api_cost_usd": 0.0,
+        "normalized_model_api_cost_per_60min_usd": 0.0,
+        "fatal_error": str(error),
+        "degraded": True,
+    }
+    for p, obj in ((out_path, answers), (log_path, log)):
+        try:
+            with open(p, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(obj, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+    print(f"emergency output written to {out_path} and {log_path}", file=sys.stderr)
 
 
 def process_video(vid, path, questions, cfg, detector, vlm, clock0, per_question_logs):
@@ -172,8 +208,8 @@ def process_video(vid, path, questions, cfg, detector, vlm, clock0, per_question
 
 def main():
     ap = argparse.ArgumentParser(description="Kitchen CCTV QA agent (builderr submission)")
-    ap.add_argument("--videos", required=True, help="directory of videos, single file, or URL")
-    ap.add_argument("--questions", required=True)
+    ap.add_argument("--videos", default=None, help="directory of videos, single file, or URL")
+    ap.add_argument("--questions", default=None)
     ap.add_argument("--out", required=True)
     ap.add_argument("--log", required=True)
     ap.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml"))
@@ -181,6 +217,16 @@ def main():
     ap.add_argument("--download-only", action="store_true", help="fetch/load model weights then exit (pre-warm cache outside timed runs)")
     args = ap.parse_args()
 
+    state = {"questions": None}
+    try:
+        run(args, state)
+    except SystemExit:
+        raise
+    except Exception as e:
+        emergency_dump(args.out, args.log, state["questions"], e)
+
+
+def run(args, state):
     t0 = time.perf_counter()
     cfg = load_cfg(args.config)
     if args.limit_minutes:
@@ -192,7 +238,17 @@ def main():
     from agent.io_utils import dump_json, load_json
     from agent.vlm import VLM
 
+    if args.download_only:
+        detector = Detector(cfg, None)
+        vlm = VLM(cfg, None)
+        download_only(cfg, detector, vlm)
+        return
+
+    if not args.videos or not args.questions:
+        raise ValueError("--videos and --questions are required unless --download-only is used")
+
     questions = load_json(args.questions)
+    state["questions"] = questions
     videos = discover_videos(args.videos)
 
     detector = Detector(cfg, None)

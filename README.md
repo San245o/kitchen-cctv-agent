@@ -4,6 +4,28 @@ Answers operational questions (caps/hairnets worn, person counts, event timestam
 durations, event order, on-screen text) from fixed-camera kitchen footage. Built for
 the builderr Kitchen CCTV challenge.
 
+## Evaluator setup (reproducible warm-up path)
+
+```bash
+# 1. install + verify models (safe to run outside the timed window)
+bash scripts/setup_models.sh          # Windows: powershell scripts/setup_models.ps1
+
+# 2. scored run (one command)
+python answer.py --videos ./videos --questions questions.json --out answers.json --log run_log.json
+```
+
+Guarantees:
+
+- `answer.py` **always writes a schema-valid `answers.json` and `run_log.json`** — even if
+  model weights are missing, downloads fail, or an unexpected error occurs. In that case
+  answers degrade to `not_visible` with reasons, and `run_log.json` records the failure.
+- The VLM loads via a fallback ladder: Qwen3-VL-4B → Cosmos-Reason2-2B → Qwen3-VL-2B →
+  degraded mode. The tier that actually served is recorded in `run_log.json`.
+- `--download-only` fetches and verifies all weights without answering anything; run it
+  before the timed evaluation to keep model download out of the wall-clock budget.
+- Minimal-deps mode: `pip install -r requirements-minimal.txt` alone supports a complete,
+  valid (degraded) run.
+
 ## One-command run
 
 ```bash

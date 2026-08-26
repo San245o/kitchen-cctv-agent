@@ -71,31 +71,36 @@ class VLM:
         self._attempted = False
         self.available = False
 
+    def _try_load(self, mid):
+        import torch
+        from transformers import AutoModelForImageTextToText, AutoProcessor
+
+        self.processor = AutoProcessor.from_pretrained(mid)
+        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        model = AutoModelForImageTextToText.from_pretrained(mid, dtype=dtype)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model.to(device)
+        model.eval()
+        self.model = model
+        self.device = device
+
     def ensure_loaded(self) -> bool:
         if self._attempted or self.available:
             return self.available
         self._attempted = True
-        try:
-            import torch
-            from transformers import AutoModelForImageTextToText, AutoProcessor
-
-            mid = self.model_id
-            self.processor = AutoProcessor.from_pretrained(mid)
-            dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-            self.model = AutoModelForImageTextToText.from_pretrained(mid, dtype=dtype)
-            self.device = "cuda" if torch.cuda.is_available() else "cpu"
-            self.model.to(self.device)
-            self.model.eval()
-            self.available = True
-        except Exception as e:
-            err = f"{self.model_id}: {e}"
-            self.load_error = err if not self.load_error else f"{self.load_error} | {err}"
-            alt = self.cfg.get("alternate")
-            if alt and alt != self.model_id:
-                self.model_id = alt
-                self._attempted = False
-                return self.ensure_loaded()
-        return self.available
+        ladder = [self.cfg["primary"], self.cfg.get("alternate")] + list(
+            self.cfg.get("fallbacks", [])
+        )
+        for mid in [m for m in ladder if m]:
+            try:
+                self._try_load(mid)
+                self.model_id = mid
+                self.available = True
+                return True
+            except Exception as e:
+                err = f"{mid}: {e}"
+                self.load_error = err if not self.load_error else f"{self.load_error} | {err}"
+        return False
 
     def _generate(self, images, prompt: str):
         if not images:
