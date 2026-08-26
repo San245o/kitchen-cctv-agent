@@ -10,10 +10,10 @@ models:
     iou: 0.45
     imgsz: 960
   vlm:
-    primary: Qwen/Qwen3-VL-4B-Instruct
-    alternate: nvidia/Cosmos-Reason2-2B
+    primary: Qwen/Qwen3-VL-2B-Instruct
+    alternate: Qwen/Qwen3-VL-4B-Instruct
     fallbacks:
-      - Qwen/Qwen3-VL-2B-Instruct
+      - nvidia/Cosmos-Reason2-2B
     max_new_tokens: 256
     max_frames_per_call: 4
     call_timeout_seconds: 180

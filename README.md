@@ -6,21 +6,37 @@ the builderr Kitchen CCTV challenge.
 
 ## Evaluator setup (reproducible warm-up path)
 
-```bash
-# 1. install + verify models (safe to run outside the timed window)
-bash scripts/setup_models.sh          # Windows: powershell scripts/setup_models.ps1
+Cross-platform: plain `pip` only, no system packages, no compilation. Models are
+fetched automatically from Hugging Face on first load.
 
-# 2. scored run (one command)
+```bash
+# Linux / macOS
+bash scripts/setup_models.sh
+
+# Windows PowerShell
+powershell scripts/setup_models.ps1    # uses CUDA 12.8 torch wheels (RTX 50-series)
+```
+
+Or manually:
+
+```bash
+pip install -r requirements.txt
+python answer.py --out .warmup.json --log .warmup_log.json --download-only   # verify weights load
 python answer.py --videos ./videos --questions questions.json --out answers.json --log run_log.json
 ```
+
+First run downloads ~4.7 GB (YOLO26s + Qwen3-VL-2B). The VLM ladder is
+Qwen3-VL-2B → Qwen3-VL-4B → Cosmos-Reason2-2B → degraded; the serving tier is
+recorded in `run_log.json`. Model loading happens **before** the wall-clock
+clock starts, so fixed load cost never eats a short clip's scaled budget.
 
 Guarantees:
 
 - `answer.py` **always writes a schema-valid `answers.json` and `run_log.json`** — even if
   model weights are missing, downloads fail, or an unexpected error occurs. In that case
   answers degrade to `not_visible` with reasons, and `run_log.json` records the failure.
-- The VLM loads via a fallback ladder: Qwen3-VL-4B → Cosmos-Reason2-2B → Qwen3-VL-2B →
-  degraded mode. The tier that actually served is recorded in `run_log.json`.
+- The VLM loads via a fallback ladder (see above). The tier that actually served is
+  recorded in `run_log.json`.
 - `--download-only` fetches and verifies all weights without answering anything; run it
   before the timed evaluation to keep model download out of the wall-clock budget.
 - Minimal-deps mode: `pip install -r requirements-minimal.txt` alone supports a complete,
@@ -89,7 +105,8 @@ CPU-only runs work but will be slow; the code degrades gracefully when model
 weights are unavailable (answers become `not_visible` rather than guesses).
 
 First run downloads weights automatically: `yolo26s.pt` (~20MB) and
-`Qwen/Qwen3-VL-4B-Instruct` (~8GB). Set `HF_HOME` to control cache location.
+`Qwen/Qwen3-VL-2B-Instruct` (~4.4GB), with larger tiers as fallback. Set `HF_HOME`
+to control cache location.
 
 ## Question archetypes routed
 

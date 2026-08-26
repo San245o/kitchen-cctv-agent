@@ -227,7 +227,6 @@ def main():
 
 
 def run(args, state):
-    t0 = time.perf_counter()
     cfg = load_cfg(args.config)
     if args.limit_minutes:
         cfg["budgets"]["wall_clock_minutes"] = args.limit_minutes
@@ -247,6 +246,12 @@ def run(args, state):
     if not args.videos or not args.questions:
         raise ValueError("--videos and --questions are required unless --download-only is used")
 
+    detector = Detector(cfg, None)
+    vlm = VLM(cfg, None)
+    detector.ensure_loaded()
+    vlm.ensure_loaded()
+
+    t0 = time.perf_counter()
     questions = load_json(args.questions)
     state["questions"] = questions
     videos = discover_videos(args.videos)
