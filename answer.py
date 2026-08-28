@@ -1,6 +1,8 @@
 import argparse
+import hashlib
 import os
 import random
+import secrets
 import sys
 import time
 
@@ -79,9 +81,10 @@ def discover_videos(path):
     return {base: path}
 
 
-def resolve_url(url: str) -> str:
-    os.makedirs("cache", exist_ok=True)
-    name = os.path.join("cache", f"dl_{abs(hash(url)) % 10**10}.mp4")
+def resolve_url(url: str, cache_dir: str) -> str:
+    os.makedirs(cache_dir, exist_ok=True)
+    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+    name = os.path.join(cache_dir, f"dl_{digest}.mp4")
     if os.path.exists(name):
         return name
     if "youtube.com" in url or "youtu.be" in url:
@@ -100,9 +103,17 @@ def resolve_url(url: str) -> str:
 
 
 def download_only(cfg, detector, vlm):
+    from agent.semantic import SemanticIndex
+
     ok_d = detector.ensure_loaded()
+    semantic = SemanticIndex(cfg, None)
+    ok_s = semantic.ensure_loaded()
+    semantic.release_model()
     ok_v = vlm.ensure_loaded()
-    print(f"detector ready: {ok_d} | vlm ready: {ok_v} ({vlm.model_id})")
+    print(
+        f"detector ready: {ok_d} | retriever ready: {ok_s} ({semantic.model_id}) "
+        f"| vlm ready: {ok_v} ({vlm.model_id})"
+    )
     if vlm.load_error:
         print("load errors:", vlm.load_error, file=sys.stderr)
     if not ok_v:
@@ -150,6 +161,7 @@ def process_video(vid, path, questions, cfg, detector, vlm, clock0, per_question
     from agent.frames import FrameStore
     from agent.handlers import Ctx, not_visible
     from agent.router import route
+    from agent.semantic import SemanticIndex
 
     answers = []
     probe = Budget(3600.0, cfg["budgets"], clock0=clock0)
@@ -161,9 +173,34 @@ def process_video(vid, path, questions, cfg, detector, vlm, clock0, per_question
         tmp.close()
     except Exception as e:
         print(f"warn: cannot open {path}: {e}", file=sys.stderr)
+        for q in questions:
+            routed = route(q.get("question", ""), q.get("type"))
+            answers.append(
+                {
+                    "id": q.get("id"),
+                    "answer": "not_visible",
+                    "confidence": 0.3,
+                    "evidence": [],
+                    "reason": "video unavailable or unreadable",
+                }
+            )
+            per_question_logs.append(
+                {
+                    "id": q.get("id"),
+                    "video_id": vid,
+                    "routed_handler": routed.handler,
+                    "declared_type": routed.qtype,
+                    "target_time": routed.target_time,
+                    "frames_used": 0,
+                    "frame_timestamps": [],
+                    "model_calls_used": 0,
+                    "model_calls": [],
+                }
+            )
         return answers, None
 
     budget = Budget(duration, cfg["budgets"], clock0=clock0)
+    budget.video_id = vid
     detector.budget = budget
     vlm.budget = budget
     ctx = None
@@ -172,13 +209,25 @@ def process_video(vid, path, questions, cfg, detector, vlm, clock0, per_question
         store = FrameStore(path, budget, cfg["sampling"])
         CACHE_DIRS.append(store.cache_dir)
         store.build_coarse()
-        ctx = Ctx(vid, store, detector, vlm, budget, cfg)
+        query_texts = []
+        for q in questions:
+            routed = route(q.get("question", ""), q.get("type"))
+            query_texts.extend([routed.raw_question, routed.phrase, *routed.options])
+        semantic = SemanticIndex(cfg, budget)
+        semantic.build(store, query_texts)
+        semantic.release_model()
+        budget.semantic_model = semantic.model_id
+        budget.semantic_available = bool(semantic.image_features is not None)
+        budget.semantic_error = semantic.load_error
+        ctx = Ctx(vid, store, detector, vlm, budget, cfg, semantic=semantic)
     except Exception as e:
         print(f"warn: indexing failed for {path}: {e}", file=sys.stderr)
 
     for q in questions:
         qid = q.get("id")
         r = route(q.get("question", ""), q.get("type"))
+        frame_start = len(budget.frame_records)
+        call_start = len(budget.calls)
         if ctx is None:
             ans = not_visible(qid, "video unavailable or unreadable")
         elif budget.exhausted:
@@ -209,8 +258,10 @@ def process_video(vid, path, questions, cfg, detector, vlm, clock0, per_question
                 "routed_handler": r.handler,
                 "declared_type": r.qtype,
                 "target_time": r.target_time,
-                "frames_used": budget.frames_processed,
-                "vlm_calls_used": budget.vlm_calls,
+                "frames_used": len(budget.frame_records) - frame_start,
+                "frame_timestamps": [f.to_dict() for f in budget.frame_records[frame_start:]],
+                "model_calls_used": len(budget.calls) - call_start,
+                "model_calls": [c.to_dict() for c in budget.calls[call_start:]],
             }
         )
     if store is not None:
@@ -260,21 +311,21 @@ def run(args, state):
     if not args.videos or not args.questions:
         raise ValueError("--videos and --questions are required unless --download-only is used")
 
+    t0 = time.perf_counter()
     detector = Detector(cfg, None)
     vlm = VLM(cfg, None)
     detector.ensure_loaded()
-    vlm.ensure_loaded()
-
-    t0 = time.perf_counter()
     questions = load_json(args.questions)
     state["questions"] = questions
     videos = discover_videos(args.videos)
-
-    detector = Detector(cfg, None)
-    vlm = VLM(cfg, None)
-    if args.download_only:
-        download_only(cfg, detector, vlm)
-        return
+    cache_parent = os.path.dirname(os.path.abspath(args.log))
+    os.makedirs(cache_parent, exist_ok=True)
+    run_cache_dir = os.path.join(
+        cache_parent, f".kitchen-cctv-cache-{os.getpid()}-{secrets.token_hex(3)}"
+    )
+    os.makedirs(run_cache_dir, exist_ok=False)
+    CACHE_DIRS.append(run_cache_dir)
+    cfg["sampling"] = dict(cfg["sampling"], cache_dir=run_cache_dir)
 
     by_video = {}
     for q in questions:
@@ -309,7 +360,7 @@ def run(args, state):
             continue
         try:
             if path.lower().startswith(("http://", "https://")):
-                path = resolve_url(path)
+                path = resolve_url(path, run_cache_dir)
         except Exception as e:
             print(f"warn: cannot fetch {path}: {e}", file=sys.stderr)
             for q in qs:
@@ -344,8 +395,10 @@ def run(args, state):
         "estimated_model_api_cost_usd": round(cost_total, 6),
         "normalized_model_api_cost_per_60min_usd": round(norm_cost, 6),
         "within_caps": {
-            "runtime_under_global_limit": runtime < wall_limit,
-            "frames_within_budget": True,
+            "runtime_under_global_limit": runtime <= wall_limit,
+            "frames_within_budget": all(b.frames_processed <= b.frame_cap for b in budgets),
+            "model_calls_within_budget": all(len(b.calls) <= b.calls_cap for b in budgets),
+            "cost_within_normalized_limit": norm_cost <= 0.30,
             "local_models_only": True,
         },
         "caps": {
@@ -356,6 +409,13 @@ def run(args, state):
         },
         "models": {
             "detector": {"weights": cfg["models"]["detector"]["weights"], "available": detector.available},
+            "retriever": {
+                "model": cfg["models"].get("retriever", {}).get("model"),
+                "available": any(getattr(b, "semantic_available", False) for b in budgets),
+                "load_errors": [
+                    b.semantic_error for b in budgets if getattr(b, "semantic_error", None)
+                ],
+            },
             "vlm": {
                 "primary": cfg["models"]["vlm"]["primary"],
                 "loaded_as": vlm.model_id if vlm.available else None,
@@ -364,8 +424,19 @@ def run(args, state):
             },
         },
         "per_question": per_question_logs,
+        "frames": [
+            {"video_id": b.video_id, **frame.to_dict()}
+            for b in budgets
+            for frame in b.frame_records
+        ],
+        "calls": [
+            {"video_id": b.video_id, **call.to_dict()}
+            for b in budgets
+            for call in b.calls
+        ],
         "seed": int(cfg["runtime"].get("seed", 0)),
     }
+    run_log["valid_under_hard_caps"] = all(run_log["within_caps"].values())
     dump_json(args.out, all_answers)
     dump_json(args.log, run_log)
     print(f"wrote {args.out} ({len(all_answers)} answers) and {args.log}")

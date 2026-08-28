@@ -1,4 +1,5 @@
 import numpy as np
+import time
 
 
 class Detector:
@@ -30,15 +31,34 @@ class Detector:
     def detect_persons(self, img: np.ndarray):
         if not self.ensure_loaded():
             return []
-        self.budget.log_call(self.name, "detect")
-        res = self.model.predict(
-            img,
-            classes=[0],
-            conf=float(self.cfg["conf"]),
-            iou=float(self.cfg["iou"]),
-            imgsz=int(self.cfg["imgsz"]),
-            verbose=False,
-        )[0]
+        if self.budget is None or self.budget.exhausted:
+            return []
+        started = time.perf_counter()
+        try:
+            res = self.model.predict(
+                img,
+                classes=[0],
+                conf=float(self.cfg["conf"]),
+                iou=float(self.cfg["iou"]),
+                imgsz=int(self.cfg["imgsz"]),
+                verbose=False,
+            )[0]
+            self.budget.log_call(
+                self.name,
+                "detector_person",
+                started_at=started,
+                duration_seconds=time.perf_counter() - started,
+            )
+        except Exception as exc:
+            self.budget.log_call(
+                self.name,
+                "detector_person",
+                started_at=started,
+                duration_seconds=time.perf_counter() - started,
+                success=False,
+                error=exc,
+            )
+            return []
         out = []
         for b in res.boxes:
             x1, y1, x2, y2 = [float(v) for v in b.xyxy[0].tolist()]

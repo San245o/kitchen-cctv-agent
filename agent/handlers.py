@@ -25,24 +25,29 @@ def not_visible(qid, reason="insufficient visual evidence"):
 
 
 def interpret_times(t, duration):
-    times = [float(t)]
-    if t is not None and 0 < t < 360 and duration >= 900:
-        alt = float(t) * 60.0
-        if alt <= duration:
-            times.append(alt)
-    return times
+    return [float(t)]
 
 
 class Ctx:
-    def __init__(self, video_id, store, detector, vlm, budget, cfg):
+    def __init__(self, video_id, store, detector, vlm, budget, cfg, semantic=None):
         self.video_id = video_id
         self.store = store
         self.detector = detector
         self.vlm = vlm
         self.budget = budget
         self.cfg = cfg
+        self.semantic = semantic
         self.zone_cache: dict[str, tuple | None] = {}
         self.duration = store.duration
+
+    def rank_candidates(self, text, zone=None, top_k=None):
+        semantic_scores = self.semantic.scores(text) if self.semantic is not None else None
+        return self.store.rank_candidates(
+            zone,
+            top_k=top_k or int(self.cfg["thresholds"]["candidate_top_k"]),
+            semantic_scores=semantic_scores,
+            semantic_weight=float(self.cfg["thresholds"].get("semantic_weight", 0.75)),
+        )
 
     def zone_for(self, text: str):
         low = (text or "").lower()
@@ -55,6 +60,8 @@ class Ctx:
             return None
         if phrase in self.zone_cache:
             return self.zone_cache[phrase]
+        if not self.store.coarse_times:
+            return None
         frame_t = self.store.coarse_times[len(self.store.coarse_times) // 2]
         img = self.store.get_coarse(frame_t)
         box = self.vlm.locate(img, phrase) if img is not None else None
@@ -165,16 +172,37 @@ def handle_count(r, ctx: Ctx):
 def handle_state(r, ctx: Ctx):
     base_t = r.target_time if r.target_time is not None else ctx.duration / 2
     low = r.raw_question.lower()
+    is_ppe = any(w in low for w in ["wearing", "cap", "hairnet", "head cover"])
     object_words = ["container", "lid", "bag", "box", "sealed", "closed"]
     uses_object = (
         any(w in low for w in object_words)
-        and "wearing" not in low
-        and "cap" not in low
-        and "hairnet" not in low
+        and not is_ppe
     )
     zone = ctx.zone_for(r.raw_question)
 
-    votes = []
+    if not uses_object and not is_ppe:
+        best_timed = None
+        for t in interpret_times(base_t, ctx.duration):
+            frames = ctx.neighbor_frames(t, int(ctx.cfg["thresholds"]["consensus_of"]))
+            if not frames:
+                continue
+            value, conf = ctx.vlm.verify_window(frames, r.raw_question)
+            if value is not None and (best_timed is None or conf > best_timed[1]):
+                best_timed = (value, conf, t)
+        if best_timed is None or best_timed[1] < float(
+            ctx.cfg["thresholds"]["min_answer_confidence"]
+        ):
+            return not_visible("state", f"timed action not clear at t={base_t}")
+        value, conf, used_t = best_timed
+        return {
+            "answer": value,
+            "confidence": conf,
+            "evidence": [
+                {"video_id": ctx.video_id, **span(used_t - 1.5, used_t + 1.5, ctx.duration)}
+            ],
+        }
+
+    answer_best = None
     used_t = base_t
     for t in interpret_times(base_t, ctx.duration):
         frames = ctx.neighbor_frames(t, int(ctx.cfg["thresholds"]["consensus_of"]))
@@ -197,21 +225,21 @@ def handle_state(r, ctx: Ctx):
                 if not persons:
                     round_votes.append((None, 0.3))
                     continue
-                best = max(persons, key=lambda b: b[4])
-                hb = head_box(best, w, h)
+                person = max(persons, key=lambda b: b[4])
+                hb = head_box(person, w, h)
                 crop = crop_upscale(img, hb, scale=3)
                 v, c = ctx.vlm.yes_no(crop, "Is the person in this image wearing a cap or hairnet on their head?")
             round_votes.append((v, c))
         ans, conf = consensus(round_votes, int(ctx.cfg["thresholds"]["consensus_min_agree"]))
-        if ans is not None and (best is None or conf > best[1]):
-            best = (ans, conf, list(round_votes))
+        if ans is not None and (answer_best is None or conf > answer_best[1]):
+            answer_best = (ans, conf, list(round_votes))
             used_t = t
         if ans is not None and conf >= float(ctx.cfg["thresholds"]["min_answer_confidence"]):
             break
 
-    if "best" not in dir() or best is None:
+    if answer_best is None:
         return not_visible("state", f"weak evidence at t={base_t}")
-    ans, conf, votes = best
+    ans, conf, votes = answer_best
     if conf < float(ctx.cfg["thresholds"]["min_answer_confidence"]):
         return not_visible("state", f"weak evidence votes={votes}")
     ev = span(used_t - 1.0, used_t + 1.0, ctx.duration)
@@ -227,7 +255,8 @@ def handle_timestamp(r, ctx: Ctx):
     phrase = r.phrase or "the described event"
     want_last = (r.first_last == "last") or ("last" in phrase.lower() and "how long" not in phrase.lower())
     zone = ctx.zone_for(phrase)
-    candidates = sorted(ctx.store.rank_candidates(zone))
+    top_k = int(ctx.cfg["thresholds"]["candidate_top_k"])
+    candidates = sorted(ctx.rank_candidates(phrase, zone, top_k=top_k))
     refine_max = int(ctx.cfg["thresholds"]["refine_max_steps"])
     micro = float(ctx.cfg["sampling"]["micro_stride_seconds"])
 
@@ -366,23 +395,22 @@ def handle_mc(r, ctx: Ctx):
         else:
             zone = ctx.zone_for(opt)
             v, c = None, 0.0
-            for cand in ctx.store.rank_candidates(zone, top_k=3):
+            for cand in ctx.rank_candidates(opt, zone, top_k=3):
                 vv, cc, _f = ctx.verify_window(cand, f"is this showing {opt}?")
                 if vv == "yes":
-                    v, c = vv, cc
+                    v, c, hit_t = vv, cc, cand
                     break
         if v == "yes":
-            scored.append((opt, c))
+            scored.append((opt, c, t_ref if t_ref is not None else hit_t))
     if not scored:
         return not_visible("mc", "no option verifiably shown")
     scored.sort(key=lambda kv: kv[1], reverse=True)
-    opt, conf = scored[0]
-    ev_t = t_ref if t_ref is not None else ctx.duration / 2
+    opt, conf, ev_t = scored[0]
     return {
         "answer": opt,
         "confidence": round(min(conf, 0.9), 2),
         "evidence": [{"video_id": ctx.video_id, **span(ev_t - 1.0, ev_t + 1.0, ctx.duration)}],
-        "alternatives_rejected": [o for o, _ in scored[1:]],
+        "alternatives_rejected": [o for o, _c, _t in scored[1:]],
     }
 
 
@@ -393,7 +421,7 @@ def handle_ocr(r, ctx: Ctx):
     if r.target_time is not None:
         tries = [ctx.store.nearest_coarse_time(r.target_time)]
     else:
-        ranked = ctx.store.rank_candidates(None, top_k=3)
+        ranked = ctx.rank_candidates(r.raw_question, None, top_k=6)
         tries = ranked if ranked else ctx.store.coarse_times[:: max(1, len(ctx.store.coarse_times) // 3)]
     result = None
     for tt in tries[:3]:
@@ -444,7 +472,7 @@ def handle_ocr(r, ctx: Ctx):
 def handle_general_yesno(r, ctx: Ctx):
     phrase = r.phrase or r.raw_question.rstrip("?")
     zone = ctx.zone_for(phrase)
-    candidates = ctx.store.rank_candidates(zone, top_k=6)
+    candidates = ctx.rank_candidates(phrase, zone, top_k=6)
     votes = []
     used = []
     for t_cand in candidates:
@@ -460,8 +488,14 @@ def handle_general_yesno(r, ctx: Ctx):
         return not_visible("general_yesno", "no frames available to verify")
     if ans is None:
         return not_visible("general_yesno", "event never clearly observed")
+    evidence_times = [t for (t, (v, _c)) in zip(used, votes) if v == ans]
+    if not evidence_times:
+        evidence_times = used
     return {
         "answer": ans,
         "confidence": conf,
-        "evidence": [{"video_id": ctx.video_id, **span(min(used), max(used) + 1.5, ctx.duration)}],
+        "evidence": [
+            {"video_id": ctx.video_id, **span(t - 0.5, t + 0.5, ctx.duration)}
+            for t in evidence_times[:3]
+        ],
     }

@@ -43,7 +43,8 @@ class FrameStore:
         self.duration = max(self.n_frames / self.fps, 1e-3)
         base = os.path.splitext(os.path.basename(video_path))[0]
         tag = hashlib.md5(video_path.encode()).hexdigest()[:8]
-        self.cache_dir = os.path.join("cache", f"{base}_{tag}")
+        cache_root = cfg.get("cache_dir", "cache")
+        self.cache_dir = os.path.join(cache_root, f"{base}_{tag}")
         os.makedirs(self.cache_dir, exist_ok=True)
         stride = float(cfg.get("coarse_stride_seconds", 3.0))
         times = np.arange(0.0, self.duration, stride)
@@ -58,7 +59,8 @@ class FrameStore:
         self._lru_max = 24
 
     def _disk_path(self, t: float) -> str:
-        return os.path.join(self.cache_dir, f"f_{round(float(t), 2):.2f}.jpg")
+        t = max(0.0, min(float(t), self.duration))
+        return os.path.join(self.cache_dir, f"f_{round(t, 2):.2f}.jpg")
 
     def _seek(self, t: float):
         self.cap.set(self.cv2.CAP_PROP_POS_MSEC, max(0.0, t * 1000.0 - 5.0))
@@ -80,7 +82,12 @@ class FrameStore:
         return None
 
     def _decode(self, t: float, fine: bool):
-        allowed = self.budget.spend_fine(1) if fine else self.budget.spend_coarse(1)
+        t = max(0.0, min(float(t), self.duration))
+        allowed = (
+            self.budget.spend_fine(1, timestamp=t)
+            if fine
+            else self.budget.spend_coarse(1, timestamp=t)
+        )
         if not allowed:
             return None
         img = self._seek(t)
@@ -111,7 +118,7 @@ class FrameStore:
             prev_thumb = gray
 
     def get_coarse(self, t: float):
-        key = round(float(t), 2)
+        key = round(max(0.0, min(float(t), self.duration)), 2)
         if key in self._lru:
             self._lru.move_to_end(key)
             return self._lru[key]
@@ -123,7 +130,7 @@ class FrameStore:
         return None
 
     def get_fine(self, t: float):
-        key = round(float(t), 2)
+        key = round(max(0.0, min(float(t), self.duration)), 2)
         if key in self._lru:
             self._lru.move_to_end(key)
             return self._lru[key]
@@ -143,8 +150,8 @@ class FrameStore:
             return dict(self.motion)
         zx1 = int(max(0.0, min(1.0, zone_norm[0])) * THUMB_W)
         zy1 = int(max(0.0, min(1.0, zone_norm[1])) * THUMB_H)
-        zx2 = int(max(1.0, min(1.0, zone_norm[2])) * THUMB_W)
-        zy2 = int(max(1.0, min(1.0, zone_norm[3])) * THUMB_H)
+        zx2 = max(zx1 + 1, int(max(0.0, min(1.0, zone_norm[2])) * THUMB_W))
+        zy2 = max(zy1 + 1, int(max(0.0, min(1.0, zone_norm[3])) * THUMB_H))
         times = sorted(self.thumbs.keys())
         out = {}
         prev_t = None
@@ -153,18 +160,52 @@ class FrameStore:
                 out[t] = 0.0
             else:
                 d = np.abs(
-                    self.thumbs[t][:, zx1:zx2].astype(int)
-                    - self.thumbs[prev_t][:, zx1:zx2].astype(int)
+                    self.thumbs[t][zy1:zy2, zx1:zx2].astype(int)
+                    - self.thumbs[prev_t][zy1:zy2, zx1:zx2].astype(int)
                 )
                 out[t] = float(d.mean())
             prev_t = t
         return out
 
-    def rank_candidates(self, zone_norm=None, top_k=None):
+    def rank_candidates(
+        self,
+        zone_norm=None,
+        top_k=None,
+        semantic_scores=None,
+        semantic_weight=0.75,
+        min_gap_seconds=None,
+    ):
         top_k = top_k or 12
         series = self.zone_motion(zone_norm)
-        scored = sorted(series.items(), key=lambda kv: kv[1], reverse=True)
-        return [float(t) for t, _s in scored[:top_k]]
+        times = sorted(series)
+        if not times:
+            return []
+
+        motion = np.asarray([series[t] for t in times], dtype=np.float32)
+        lo, hi = np.percentile(motion, [5, 95]) if len(motion) > 1 else (0.0, 1.0)
+        motion = np.clip((motion - lo) / max(float(hi - lo), 1e-6), 0.0, 1.0)
+
+        if semantic_scores:
+            semantic = np.asarray([semantic_scores.get(round(float(t), 2), 0.0) for t in times], dtype=np.float32)
+            slo, shi = np.percentile(semantic, [5, 95]) if len(semantic) > 1 else (0.0, 1.0)
+            semantic = np.clip((semantic - slo) / max(float(shi - slo), 1e-6), 0.0, 1.0)
+            fused = semantic_weight * semantic + (1.0 - semantic_weight) * motion
+        else:
+            fused = motion
+
+        ranked = sorted(zip(times, fused.tolist()), key=lambda kv: kv[1], reverse=True)
+        gap = (
+            float(min_gap_seconds)
+            if min_gap_seconds is not None
+            else max(1.0, float(self.cfg.get("coarse_stride_seconds", 3.0)) * 1.5)
+        )
+        selected = []
+        for t, _score in ranked:
+            if all(abs(float(t) - prior) >= gap for prior in selected):
+                selected.append(float(t))
+            if len(selected) >= top_k:
+                break
+        return selected
 
     def close(self):
         self.cap.release()

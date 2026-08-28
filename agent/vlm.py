@@ -1,5 +1,7 @@
 import json
+import gc
 import re
+import time
 
 import numpy as np
 
@@ -32,8 +34,10 @@ class VLM:
         "Use UNSURE only if the image does not show enough detail to decide."
     )
     VERIFY_PROMPT = (
-        "These are consecutive frames from a fixed kitchen camera. "
-        "Question: {q}\nAnswer with exactly one word: YES, NO, or UNSURE."
+        "These frames are ordered from oldest to newest and come from a fixed kitchen camera. "
+        "Use visible changes across the sequence to judge actions or state transitions; do not infer "
+        "an action from an unchanged single-frame state. Question: {q}\n"
+        "Answer with exactly one word: YES, NO, or UNSURE."
     )
     READ_PROMPT = (
         "Read all visible text in this image. "
@@ -48,7 +52,7 @@ class VLM:
     LOCATE_PROMPT = (
         "Locate the {phrase} in this image. "
         'Reply with JSON only: {{"box_2d": [ymin, xmin, ymax, xmax]}} '
-        "using pixel coordinates of this exact image. If not visible, reply {{}}"
+        "using normalized integer coordinates from 0 to 1000. If not visible, reply {{}}"
     )
 
     def __init__(self, cfg: dict, budget):
@@ -100,46 +104,64 @@ class VLM:
             except Exception as e:
                 err = f"{mid}: {e}"
                 self.load_error = err if not self.load_error else f"{self.load_error} | {err}"
+                self.model = None
+                self.processor = None
+                gc.collect()
+                try:
+                    import torch
+
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
         return False
 
     def _generate(self, images, prompt: str):
         if not images:
             return None
+        if self.budget is None or self.budget.exhausted:
+            return None
         if not self.ensure_loaded():
             return None
-        import concurrent.futures
-
         timeout_s = float(self.cfg.get("call_timeout_seconds", 180))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(self._generate_inner, images, prompt)
-            try:
-                return fut.result(timeout=timeout_s)
-            except concurrent.futures.TimeoutError:
-                self.budget.log_call(self.model_id, "vlm_timeout")
-                fut.cancel()
-                return None
-
-    def _generate_inner(self, images, prompt: str):
+        started = time.perf_counter()
+        response = None
+        error = None
         try:
-            import torch
-
-            content = [{"type": "image", "image": to_pil(im)} for im in images]
-            content.append({"type": "text", "text": prompt})
-            messages = [{"role": "user", "content": content}]
-            text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            inputs = self.processor(text=[text], images=[to_pil(im) for im in images], return_tensors="pt").to(self.device)
-            with torch.inference_mode():
-                out = self.model.generate(
-                    **inputs,
-                    max_new_tokens=int(self.cfg["max_new_tokens"]),
-                    do_sample=False,
-                )
-            trimmed = out[:, inputs["input_ids"].shape[1]:]
-            resp = self.processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
-            self.budget.log_call(self.model_id, "vlm_generate")
-            return resp
-        except Exception:
+            response = self._generate_inner(images, prompt, timeout_s)
+            return response
+        except Exception as exc:
+            error = exc
             return None
+        finally:
+            self.budget.log_call(
+                self.model_id,
+                "vlm_generate",
+                started_at=started,
+                duration_seconds=time.perf_counter() - started,
+                success=response is not None,
+                error=error,
+            )
+
+    def _generate_inner(self, images, prompt: str, timeout_s: float):
+        import torch
+
+        content = [{"type": "image", "image": to_pil(im)} for im in images]
+        content.append({"type": "text", "text": prompt})
+        messages = [{"role": "user", "content": content}]
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.processor(
+            text=[text], images=[to_pil(im) for im in images], return_tensors="pt"
+        ).to(self.device)
+        with torch.inference_mode():
+            out = self.model.generate(
+                **inputs,
+                max_new_tokens=int(self.cfg["max_new_tokens"]),
+                max_time=timeout_s,
+                do_sample=False,
+            )
+        trimmed = out[:, inputs["input_ids"].shape[1] :]
+        return self.processor.batch_decode(trimmed, skip_special_tokens=True)[0].strip()
 
     def yes_no(self, img, question: str):
         resp = self._generate([img], self.YES_NO_PROMPT.format(q=question))
@@ -165,7 +187,6 @@ class VLM:
         return None, None, 0.4
 
     def locate(self, img, phrase: str):
-        h, w = img.shape[:2]
         resp = self._generate([img], self.LOCATE_PROMPT.format(phrase=phrase))
         if not resp:
             return None
@@ -178,15 +199,13 @@ class VLM:
             if not box or len(box) != 4:
                 return None
             ymin, xmin, ymax, xmax = [float(v) for v in box]
-            scale = 1000.0 if max(abs(v) for v in box) > 2.0 else 1.0
-            if scale > 1:
-                ymin, xmin, ymax, xmax = [v / scale for v in (ymin, xmin, ymax, xmax)]
-            return (
-                max(0.0, min(xmin / w if scale == 1 else xmin, 1.0)),
-                max(0.0, ymin),
-                min(1.0, xmax / w if scale == 1 else xmax),
-                min(1.0, ymax),
-            )
+            scale = 1.0 if max(abs(v) for v in box) <= 1.0 else 1000.0
+            ymin, xmin, ymax, xmax = [v / scale for v in (ymin, xmin, ymax, xmax)]
+            x1, y1 = max(0.0, min(xmin, 1.0)), max(0.0, min(ymin, 1.0))
+            x2, y2 = max(0.0, min(xmax, 1.0)), max(0.0, min(ymax, 1.0))
+            if x2 <= x1 or y2 <= y1:
+                return None
+            return (x1, y1, x2, y2)
         except Exception:
             return None
 

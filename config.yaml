@@ -9,12 +9,16 @@ models:
     conf: 0.25
     iou: 0.45
     imgsz: 960
+  retriever:
+    enabled: true
+    model: google/siglip2-base-patch16-224
+    batch_size: 24
   vlm:
     primary: Qwen/Qwen3-VL-2B-Instruct
     alternate: Qwen/Qwen3-VL-4B-Instruct
     fallbacks:
       - nvidia/Cosmos-Reason2-2B
-    max_new_tokens: 256
+    max_new_tokens: 96
     max_frames_per_call: 4
     call_timeout_seconds: 180
 
@@ -22,7 +26,7 @@ budgets:
   frames_per_video_hour: 1450
   coarse_fraction: 0.72
   wall_clock_minutes: 24
-  max_model_calls: 380
+  max_model_calls: 120
   cost_usd_per_local_call: 0.0
 
 sampling:
@@ -36,6 +40,7 @@ thresholds:
   min_answer_confidence: 0.55
   not_visible_confidence: 0.5
   candidate_top_k: 12
+  semantic_weight: 0.78
   refine_max_steps: 6
 
 zones:

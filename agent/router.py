@@ -15,7 +15,10 @@ class Routed:
 
 
 ORDER_SPLIT = re.compile(r"\s*,\s*|\s+or\s+", re.I)
-FILLER = re.compile(r"^(?:at what timestamp|what time|when)(?:was|were|did|is|are)?\b[\s:]*", re.I)
+FILLER = re.compile(
+    r"^(?:at what timestamp|what time|when)\s*(?:was|were|did|is|are)?\b[\s:]*",
+    re.I,
+)
 ORDER_HINT = re.compile(r"happened last|happened first|which .* (last|first)|before or after|order of", re.I)
 TARGET_TEXT = re.compile(
     r"is the (.+?) visible|does the (.+?) (?:show|say|read)|(?:order|receipt|ticket|label|screen) (?:number|text)?",
