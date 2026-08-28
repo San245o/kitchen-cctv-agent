@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 import numpy as np
+import yaml
 
 from agent.budget import Budget
 from agent.frames import FrameStore
@@ -13,6 +14,13 @@ from agent.vlm import VLM
 
 
 class RegressionTests(unittest.TestCase):
+    def test_submission_declares_only_the_2b_vlm(self):
+        with open("config.yaml", "r", encoding="utf-8") as handle:
+            vlm = yaml.safe_load(handle)["models"]["vlm"]
+        self.assertEqual(vlm["primary"], "Qwen/Qwen3-VL-2B-Instruct")
+        self.assertNotIn("alternate", vlm)
+        self.assertNotIn("fallbacks", vlm)
+
     def test_explicit_mmss_is_not_reinterpreted_as_minutes(self):
         routed = route("Was the cook wearing a cap at 00:45?", "yes_no")
         self.assertEqual(routed.target_time, 45.0)

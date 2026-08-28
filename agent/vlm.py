@@ -69,12 +69,6 @@ class VLM:
     def set_budget(self, budget):
         self.budget = budget
 
-    def use_alternate(self):
-        self.cfg["primary"], self.cfg["alternate"] = self.cfg["alternate"], self.cfg["primary"]
-        self.model_id = self.cfg["primary"]
-        self._attempted = False
-        self.available = False
-
     def _try_load(self, mid):
         import torch
         from transformers import AutoModelForImageTextToText, AutoProcessor
@@ -92,28 +86,24 @@ class VLM:
         if self._attempted or self.available:
             return self.available
         self._attempted = True
-        ladder = [self.cfg["primary"], self.cfg.get("alternate")] + list(
-            self.cfg.get("fallbacks", [])
-        )
-        for mid in [m for m in ladder if m]:
+        mid = self.cfg["primary"]
+        try:
+            self._try_load(mid)
+            self.model_id = mid
+            self.available = True
+            return True
+        except Exception as e:
+            self.load_error = f"{mid}: {e}"
+            self.model = None
+            self.processor = None
+            gc.collect()
             try:
-                self._try_load(mid)
-                self.model_id = mid
-                self.available = True
-                return True
-            except Exception as e:
-                err = f"{mid}: {e}"
-                self.load_error = err if not self.load_error else f"{self.load_error} | {err}"
-                self.model = None
-                self.processor = None
-                gc.collect()
-                try:
-                    import torch
+                import torch
 
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                except Exception:
-                    pass
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
         return False
 
     def _generate(self, images, prompt: str):

@@ -116,9 +116,18 @@ def download_only(cfg, detector, vlm):
     )
     if vlm.load_error:
         print("load errors:", vlm.load_error, file=sys.stderr)
-    if not ok_v:
+    if not (ok_d and ok_s and ok_v):
+        missing = [
+            name
+            for name, ready in (
+                ("detector", ok_d),
+                ("retriever", ok_s),
+                ("vlm", ok_v),
+            )
+            if not ready
+        ]
         print(
-            "warning: no VLM available; runs will degrade to not_visible answers.\n"
+            f"error: warm-up incomplete; unavailable components: {', '.join(missing)}.\n"
             "hint for RTX 50-series: pip install torch --index-url https://download.pytorch.org/whl/cu128",
             file=sys.stderr,
         )

@@ -25,8 +25,8 @@ python answer.py --out .warmup.json --log .warmup_log.json --download-only   # v
 python answer.py --videos ./videos --questions questions.json --out answers.json --log run_log.json
 ```
 
-First run downloads ~6.2 GB (YOLO26s + SigLIP2-base + Qwen3-VL-2B). The VLM ladder is
-Qwen3-VL-2B → Qwen3-VL-4B → Cosmos-Reason2-2B → degraded; the serving tier is
+First run downloads ~6.2 GB (YOLO26s + SigLIP2-base + Qwen3-VL-2B). Qwen3-VL-2B is
+the only declared VLM; no 4B model is required or downloaded. The serving model is
 recorded in `run_log.json`. Model loading happens **before** the wall-clock
 clock starts, so fixed load cost never eats a short clip's scaled budget.
 
@@ -35,9 +35,10 @@ Guarantees:
 - `answer.py` **always writes a schema-valid `answers.json` and `run_log.json`** — even if
   model weights are missing, downloads fail, or an unexpected error occurs. In that case
   answers degrade to `not_visible` with reasons, and `run_log.json` records the failure.
-- The VLM loads via a fallback ladder (see above). The tier that actually served is
-  recorded in `run_log.json`.
-- `--download-only` fetches and verifies all weights without answering anything; run it
+- The VLM uses `Qwen/Qwen3-VL-2B-Instruct` exclusively. If it cannot load, the run
+  degrades safely rather than attempting a larger undeclared model.
+- `--download-only` fetches and verifies every declared component without answering anything;
+  it exits non-zero if the detector, retriever, or 2B VLM cannot load. Run it
   before the timed evaluation to keep model download out of the wall-clock budget.
 - Minimal-deps mode: `pip install -r requirements-minimal.txt` alone supports a complete,
   valid (degraded) run.
@@ -112,7 +113,7 @@ weights are unavailable (answers become `not_visible` rather than guesses).
 
 First run downloads weights automatically: `yolo26s.pt` (~20MB),
 `google/siglip2-base-patch16-224` (~1.5GB), and
-`Qwen/Qwen3-VL-2B-Instruct` (~4.4GB), with larger tiers as fallback. Set `HF_HOME`
+`Qwen/Qwen3-VL-2B-Instruct` (~4.4GB), with no larger VLM fallback. Set `HF_HOME`
 to control cache location.
 
 ## Question archetypes routed
@@ -155,7 +156,7 @@ later questions degrade to `not_visible` and this is visible in `run_log.json`.
 
 | Model | Status | Promote if |
 |---|---|---|
-| Cosmos-Reason2-2B | bench | beats Qwen3-VL-4B on sample bake-off (`models.vlm.alternate`) |
+| Cosmos-Reason2-2B | research only | promising physical reasoning model, not declared by this submission |
 | RF-DETR-base | bench | YOLO misses people at your camera angle |
 | PP-OCRv5 | bench | VLM OCR fails on burned-in clocks/receipts |
 | fine-tuned PPE nano-YOLO | bench | cap/hairnet accuracy < target on samples |

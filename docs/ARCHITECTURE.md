@@ -48,13 +48,13 @@ evidence-first answers—without a service mesh or database.
   image-text retrieval. It is used only to rank the already-budgeted coarse frames.
 - `Qwen/Qwen3-VL-2B-Instruct`: long-video/timestamp-aware VLM with strong OCR and spatial
   perception, while remaining plausible on an 8GB evaluator GPU. The previous 4B-first setup
-  did not complete in the public evaluation, so 4B remains a fallback rather than the default.
+  did not complete in the public evaluation, so this submission declares and warms only 2B.
 - `yolo26s.pt`: fast person counts and head crops; the VLM is not asked to invent counts.
 
 Cosmos Reason 2 is highly relevant to physical/video reasoning and is used by NVIDIA VSS, but
 the public Hugging Face checkpoint is gated and NVIDIA documents substantially larger validated
-hardware for its VSS deployment. It is therefore only a fallback, not a reproducibility
-dependency. InternVideo2.5 and newer temporal-grounding agents are excellent research baselines,
+hardware for its VSS deployment. It remains a research candidate and is not part of the
+reproducible evaluator setup. InternVideo2.5 and newer temporal-grounding agents are excellent research baselines,
 but their 8B-class footprints do not fit the evaluator risk profile.
 
 ## Sources

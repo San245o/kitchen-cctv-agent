@@ -15,9 +15,6 @@ models:
     batch_size: 24
   vlm:
     primary: Qwen/Qwen3-VL-2B-Instruct
-    alternate: Qwen/Qwen3-VL-4B-Instruct
-    fallbacks:
-      - nvidia/Cosmos-Reason2-2B
     max_new_tokens: 96
     max_frames_per_call: 4
     call_timeout_seconds: 180
