@@ -1,6 +1,7 @@
 import os
 import time
 import unittest
+from unittest.mock import mock_open, patch
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,9 +12,28 @@ from agent.frames import FrameStore
 from agent.handlers import handle_state, interpret_times
 from agent.router import route
 from agent.vlm import VLM
+from answer import emergency_dump, warm_models
 
 
 class RegressionTests(unittest.TestCase):
+    @patch("agent.semantic.SemanticIndex")
+    def test_warmup_checks_every_declared_component(self, semantic_cls):
+        semantic = semantic_cls.return_value
+        semantic.ensure_loaded.return_value = True
+        semantic.model_id = "retriever"
+        detector = SimpleNamespace(ensure_loaded=lambda: True)
+        vision = SimpleNamespace(ensure_loaded=lambda: True)
+        status = warm_models({}, detector, vision)
+        self.assertTrue(all(status[name] for name in ("detector", "retriever", "vlm")))
+        semantic.release_model.assert_called_once()
+
+    def test_emergency_output_handles_malformed_questions(self):
+        with patch("builtins.open", mock_open()), patch("json.dump") as dump:
+            emergency_dump("answers.json", "run_log.json", ["bad", {"id": "q2"}], RuntimeError("boom"))
+        answers = dump.call_args_list[0].args[0]
+        self.assertEqual([item["id"] for item in answers], ["q001", "q2"])
+        self.assertEqual(dump.call_count, 2)
+
     def test_submission_declares_only_the_2b_vlm(self):
         with open("config.yaml", "r", encoding="utf-8") as handle:
             vlm = yaml.safe_load(handle)["models"]["vlm"]

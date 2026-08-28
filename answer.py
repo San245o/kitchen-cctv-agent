@@ -102,7 +102,7 @@ def resolve_url(url: str, cache_dir: str) -> str:
     return name
 
 
-def download_only(cfg, detector, vlm):
+def warm_models(cfg, detector, vlm):
     from agent.semantic import SemanticIndex
 
     ok_d = detector.ensure_loaded()
@@ -110,21 +110,28 @@ def download_only(cfg, detector, vlm):
     ok_s = semantic.ensure_loaded()
     semantic.release_model()
     ok_v = vlm.ensure_loaded()
+    return {
+        "detector": ok_d,
+        "retriever": ok_s,
+        "vlm": ok_v,
+        "retriever_model": semantic.model_id,
+    }
+
+
+def download_only(cfg, detector, vlm):
+    status = warm_models(cfg, detector, vlm)
     print(
-        f"detector ready: {ok_d} | retriever ready: {ok_s} ({semantic.model_id}) "
-        f"| vlm ready: {ok_v} ({vlm.model_id})"
+        f"detector ready: {status['detector']} | "
+        f"retriever ready: {status['retriever']} ({status['retriever_model']}) "
+        f"| vlm ready: {status['vlm']} ({vlm.model_id})"
     )
     if vlm.load_error:
         print("load errors:", vlm.load_error, file=sys.stderr)
-    if not (ok_d and ok_s and ok_v):
+    if not all(status[name] for name in ("detector", "retriever", "vlm")):
         missing = [
             name
-            for name, ready in (
-                ("detector", ok_d),
-                ("retriever", ok_s),
-                ("vlm", ok_v),
-            )
-            if not ready
+            for name in ("detector", "retriever", "vlm")
+            if not status[name]
         ]
         print(
             f"error: warm-up incomplete; unavailable components: {', '.join(missing)}.\n"
@@ -139,13 +146,13 @@ def emergency_dump(out_path, log_path, questions, error):
 
     answers = [
         {
-            "id": q.get("id"),
+            "id": q.get("id", f"q{i + 1:03d}") if isinstance(q, dict) else f"q{i + 1:03d}",
             "answer": "not_visible",
             "confidence": 0.3,
             "evidence": [],
             "reason": f"agent failed to initialize: {error}",
         }
-        for q in (questions or [])
+        for i, q in enumerate(questions or [])
     ]
     log = {
         "runtime_seconds": 0.0,
@@ -320,13 +327,26 @@ def run(args, state):
     if not args.videos or not args.questions:
         raise ValueError("--videos and --questions are required unless --download-only is used")
 
-    t0 = time.perf_counter()
     detector = Detector(cfg, None)
     vlm = VLM(cfg, None)
-    detector.ensure_loaded()
     questions = load_json(args.questions)
     state["questions"] = questions
     videos = discover_videos(args.videos)
+
+    # Load every declared model before the internal budget clock. This remains
+    # best-effort during a scored run so output is guaranteed; --download-only
+    # is the strict setup check and exits non-zero on an unavailable component.
+    warm_status = warm_models(cfg, detector, vlm)
+    unavailable = [
+        name for name in ("detector", "retriever", "vlm") if not warm_status[name]
+    ]
+    if unavailable:
+        print(
+            f"warn: model warm-up incomplete ({', '.join(unavailable)}); "
+            "unanswerable questions will degrade to not_visible",
+            file=sys.stderr,
+        )
+    t0 = time.perf_counter()
     cache_parent = os.path.dirname(os.path.abspath(args.log))
     os.makedirs(cache_parent, exist_ok=True)
     run_cache_dir = os.path.join(

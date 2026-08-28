@@ -9,6 +9,9 @@ the builderr Kitchen CCTV challenge.
 Cross-platform: plain `pip` only, no system packages, no compilation. Models are
 fetched automatically from Hugging Face on first load.
 
+The exact submission metadata and evaluator commands are copied in
+[`SUBMISSION.md`](SUBMISSION.md). The supported interpreter is Python 3.11+.
+
 ```bash
 # Linux / macOS
 bash scripts/setup_models.sh
@@ -40,6 +43,8 @@ Guarantees:
 - `--download-only` fetches and verifies every declared component without answering anything;
   it exits non-zero if the detector, retriever, or 2B VLM cannot load. Run it
   before the timed evaluation to keep model download out of the wall-clock budget.
+- The normal scored command repeats a best-effort model warm-up before its internal budget
+  clock, matching the packaging pattern of submissions that completed evaluation.
 - Minimal-deps mode: `pip install -r requirements-minimal.txt` alone supports a complete,
   valid (degraded) run.
 
