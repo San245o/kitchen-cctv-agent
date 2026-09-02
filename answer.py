@@ -1,474 +1,276 @@
-import argparse
-import hashlib
+#!/usr/bin/env python3
+"""
+Next-Gen Kitchen CCTV Monitor (v2) — Builderr Challenge CLI.
+
+Usage:
+    python answer.py --videos ./videos --questions questions.json --out answers.json --log run_log.json
+"""
+
 import os
-import random
-import secrets
 import sys
-import time
+import json
+import argparse
+from pathlib import Path
+from typing import List, Dict, Any
 
-import numpy as np
-
-HOUR = 3600.0
-
-
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    try:
-        import torch
-
-        torch.manual_seed(seed)
-    except Exception:
-        pass
+from pipeline.question_router import group_questions_by_strategy
+from pipeline.motion_indexer import MotionIndexer
+from pipeline.visual_grounder import extract_frames_at_timestamps, extract_window_frames
+from pipeline.cost_governor import CostGovernor
+from pipeline.vlm_client import VLMClient
 
 
-def load_cfg(path):
-    import yaml
+def resolve_video_path(videos_dir: Path, video_id: str) -> Path:
+    """Finds video file matching video_id with standard extensions."""
+    for ext in (".mp4", ".mkv", ".avi", ".mov", ".webm"):
+        candidate = videos_dir / f"{video_id}{ext}"
+        if candidate.exists():
+            return candidate
+        candidate_upper = videos_dir / f"{video_id}{ext.upper()}"
+        if candidate_upper.exists():
+            return candidate_upper
 
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+    # Check if video_id itself has an extension
+    direct = videos_dir / video_id
+    if direct.exists():
+        return direct
 
+    # Try substring match
+    for f in videos_dir.iterdir():
+        if f.is_file() and video_id.lower() in f.stem.lower():
+            return f
 
-VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v"}
-CACHE_DIRS = []
-HANDLERS = {}
-
-
-def cleanup_cache():
-    import shutil
-
-    if os.environ.get("KEEP_CACHE") == "1":
-        print(f"keeping cache dirs: {CACHE_DIRS}")
-        return
-    for d in CACHE_DIRS:
-        shutil.rmtree(d, ignore_errors=True)
-
-
-def register_handlers():
-    from agent.handlers import (
-        handle_count,
-        handle_duration,
-        handle_general_yesno,
-        handle_mc,
-        handle_ocr,
-        handle_order,
-        handle_state,
-        handle_timestamp,
-    )
-
-    HANDLERS.update(
-        {
-            "count": handle_count,
-            "state": handle_state,
-            "timestamp": handle_timestamp,
-            "duration": handle_duration,
-            "order": handle_order,
-            "mc": handle_mc,
-            "ocr": handle_ocr,
-            "general_yesno": handle_general_yesno,
-        }
-    )
+    return None
 
 
-def discover_videos(path):
-    if os.path.isdir(path):
-        found = {}
-        for fn in sorted(os.listdir(path)):
-            if os.path.splitext(fn)[1].lower() in VIDEO_EXTS:
-                found[os.path.splitext(fn)[0]] = os.path.join(path, fn)
-        return found
-    base = os.path.splitext(os.path.basename(path))[0]
-    return {base: path}
+def process_video_questions(
+    video_path: Path,
+    video_id: str,
+    questions: List[Dict[str, Any]],
+    vlm: VLMClient,
+    governor: CostGovernor,
+    indexer: MotionIndexer,
+) -> List[Dict[str, Any]]:
+    """
+    Executes question-driven coarse-to-fine inspection for a single video.
+    """
+    print(f"\n[Video: {video_id}] Indexing activity & routing {len(questions)} questions...")
 
+    # Fast Tier 1 scan with OpenCV MotionIndexer
+    motion_info = indexer.index_video(str(video_path))
+    duration_sec = motion_info.get("duration_sec", 0.0)
+    governor.record_source_duration(duration_sec)
+    print(f"  [Indexer] Video duration: {duration_sec:.1f}s | Active intervals: {len(motion_info['active_intervals'])}")
 
-def resolve_url(url: str, cache_dir: str) -> str:
-    os.makedirs(cache_dir, exist_ok=True)
-    digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
-    name = os.path.join(cache_dir, f"dl_{digest}.mp4")
-    if os.path.exists(name):
-        return name
-    if "youtube.com" in url or "youtu.be" in url:
-        try:
-            import yt_dlp
+    grouped_qs = group_questions_by_strategy(questions)
+    video_answers: List[Dict[str, Any]] = []
 
-            with yt_dlp.YoutubeDL({"outtmpl": name, "quiet": True}) as ydl:
-                ydl.download([url])
-            return name
-        except ImportError:
-            raise RuntimeError("youtube URLs require: pip install yt-dlp")
-    import urllib.request
+    # Strategy 1: Point-in-time questions (T ± 2s)
+    pit_group = grouped_qs.get("point_in_time", [])
+    if pit_group:
+        # Group questions sharing near-identical timestamps (within 3 seconds)
+        time_clusters: Dict[float, List[Dict[str, Any]]] = {}
+        for q_meta in pit_group:
+            ts = q_meta["target_timestamp"]
+            # Find an existing cluster within 3s
+            matched_cluster = None
+            for cluster_ts in time_clusters:
+                if abs(cluster_ts - ts) <= 3.0:
+                    matched_cluster = cluster_ts
+                    break
+            if matched_cluster is not None:
+                time_clusters[matched_cluster].append(q_meta["raw"])
+            else:
+                time_clusters[ts] = [q_meta["raw"]]
 
-    urllib.request.urlretrieve(url, name)
-    return name
+        for anchor_ts, q_list in time_clusters.items():
+            print(f"  [Route: Point-in-Time] Querying {len(q_list)} Qs at T={anchor_ts:.1f}s")
+            # Extract 11 high-density frames at 2 FPS across [anchor - 2.5s, anchor + 2.5s]
+            ts_to_fetch = [
+                round(anchor_ts + delta, 2)
+                for delta in (-2.5, -2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 2.5)
+                if (anchor_ts + delta) >= 0.0 and (anchor_ts + delta) <= duration_sec
+            ]
+            frames = extract_frames_at_timestamps(str(video_path), ts_to_fetch)
+            if frames:
+                answers, prompt_text, resp_text = vlm.call_gemini(frames, q_list, video_id)
+                governor.record_call(len(frames), prompt_text, resp_text)
+                video_answers.extend(answers)
+            else:
+                video_answers.extend([
+                    {"id": q["id"], "answer": "not_visible", "confidence": 0.0, "evidence": []}
+                    for q in q_list
+                ])
 
+    # Strategy 2: Event search (actions, first/last, state changes)
+    event_group = grouped_qs.get("event_search", [])
+    if event_group:
+        raw_event_qs = [item["raw"] for item in event_group]
+        print(f"  [Route: Event Search] Querying {len(raw_event_qs)} Qs across dense candidate intervals")
+        
+        # Build dense temporal candidate set:
+        candidate_ts = []
+        # 1. Sample at 1.0 FPS across all active motion bursts (up to 200 burst frames)
+        for start, end in motion_info.get("active_intervals", [])[:15]:
+            curr = start
+            while curr <= end and len(candidate_ts) < 200:
+                candidate_ts.append(round(curr, 2))
+                curr += 1.0
 
-def warm_models(cfg, detector, vlm):
-    from agent.semantic import SemanticIndex
+        # 2. Add continuous coarse timeline coverage (every 20s) across the entire video
+        if duration_sec > 0:
+            curr = 0.0
+            while curr <= duration_sec and len(candidate_ts) < 300:
+                candidate_ts.append(round(curr, 2))
+                curr += 20.0
+        elif not candidate_ts:
+            candidate_ts = [0.0, 2.0, 5.0]
 
-    ok_d = detector.ensure_loaded()
-    semantic = SemanticIndex(cfg, None)
-    ok_s = semantic.ensure_loaded()
-    semantic.release_model()
-    ok_v = vlm.ensure_loaded()
-    return {
-        "detector": ok_d,
-        "retriever": ok_s,
-        "vlm": ok_v,
-        "retriever_model": semantic.model_id,
-    }
+        candidate_ts = sorted(list(set(candidate_ts)))[:250]
 
-
-def download_only(cfg, detector, vlm):
-    status = warm_models(cfg, detector, vlm)
-    print(
-        f"detector ready: {status['detector']} | "
-        f"retriever ready: {status['retriever']} ({status['retriever_model']}) "
-        f"| vlm ready: {status['vlm']} ({vlm.model_id})"
-    )
-    if vlm.load_error:
-        print("load errors:", vlm.load_error, file=sys.stderr)
-    if not all(status[name] for name in ("detector", "retriever", "vlm")):
-        missing = [
-            name
-            for name in ("detector", "retriever", "vlm")
-            if not status[name]
-        ]
-        print(
-            f"error: warm-up incomplete; unavailable components: {', '.join(missing)}.\n"
-            "hint for RTX 50-series: pip install torch --index-url https://download.pytorch.org/whl/cu128",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-
-def emergency_dump(out_path, log_path, questions, error):
-    import json
-
-    answers = [
-        {
-            "id": q.get("id", f"q{i + 1:03d}") if isinstance(q, dict) else f"q{i + 1:03d}",
-            "answer": "not_visible",
-            "confidence": 0.3,
-            "evidence": [],
-            "reason": f"agent failed to initialize: {error}",
-        }
-        for i, q in enumerate(questions or [])
-    ]
-    log = {
-        "runtime_seconds": 0.0,
-        "frames_processed": 0,
-        "model_calls": 0,
-        "estimated_model_api_cost_usd": 0.0,
-        "normalized_model_api_cost_per_60min_usd": 0.0,
-        "fatal_error": str(error),
-        "degraded": True,
-    }
-    for p, obj in ((out_path, answers), (log_path, log)):
-        try:
-            with open(p, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(obj, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
-    print(f"emergency output written to {out_path} and {log_path}", file=sys.stderr)
-
-
-def process_video(vid, path, questions, cfg, detector, vlm, clock0, per_question_logs):
-    from agent.budget import Budget
-    from agent.frames import FrameStore
-    from agent.handlers import Ctx, not_visible
-    from agent.router import route
-    from agent.semantic import SemanticIndex
-
-    answers = []
-    probe = Budget(3600.0, cfg["budgets"], clock0=clock0)
-    detector.budget = probe
-    vlm.budget = probe
-    try:
-        tmp = FrameStore(path, probe, cfg["sampling"])
-        duration = tmp.duration
-        tmp.close()
-    except Exception as e:
-        print(f"warn: cannot open {path}: {e}", file=sys.stderr)
-        for q in questions:
-            routed = route(q.get("question", ""), q.get("type"))
-            answers.append(
-                {
-                    "id": q.get("id"),
-                    "answer": "not_visible",
-                    "confidence": 0.3,
-                    "evidence": [],
-                    "reason": "video unavailable or unreadable",
-                }
-            )
-            per_question_logs.append(
-                {
-                    "id": q.get("id"),
-                    "video_id": vid,
-                    "routed_handler": routed.handler,
-                    "declared_type": routed.qtype,
-                    "target_time": routed.target_time,
-                    "frames_used": 0,
-                    "frame_timestamps": [],
-                    "model_calls_used": 0,
-                    "model_calls": [],
-                }
-            )
-        return answers, None
-
-    budget = Budget(duration, cfg["budgets"], clock0=clock0)
-    budget.video_id = vid
-    detector.budget = budget
-    vlm.budget = budget
-    ctx = None
-    store = None
-    try:
-        store = FrameStore(path, budget, cfg["sampling"])
-        CACHE_DIRS.append(store.cache_dir)
-        store.build_coarse()
-        query_texts = []
-        for q in questions:
-            routed = route(q.get("question", ""), q.get("type"))
-            query_texts.extend([routed.raw_question, routed.phrase, *routed.options])
-        semantic = SemanticIndex(cfg, budget)
-        semantic.build(store, query_texts)
-        semantic.release_model()
-        budget.semantic_model = semantic.model_id
-        budget.semantic_available = bool(semantic.image_features is not None)
-        budget.semantic_error = semantic.load_error
-        ctx = Ctx(vid, store, detector, vlm, budget, cfg, semantic=semantic)
-    except Exception as e:
-        print(f"warn: indexing failed for {path}: {e}", file=sys.stderr)
-
-    for q in questions:
-        qid = q.get("id")
-        r = route(q.get("question", ""), q.get("type"))
-        frame_start = len(budget.frame_records)
-        call_start = len(budget.calls)
-        if ctx is None:
-            ans = not_visible(qid, "video unavailable or unreadable")
-        elif budget.exhausted:
-            reason = "wall-clock budget exhausted" if budget.out_of_time else "model-call budget exhausted"
-            ans = not_visible(qid, reason)
+        frames = extract_frames_at_timestamps(str(video_path), candidate_ts)
+        if frames:
+            # Check if cache is beneficial (>= 32,768 tokens, ~130 frames)
+            cache = vlm.create_context_cache(frames, ttl="300s")
+            if cache:
+                answers, prompt_text, resp_text, cached_tokens = vlm.call_gemini_with_cache(cache, raw_event_qs, video_id)
+                governor.record_cached_call(cached_tokens, prompt_text, resp_text)
+                vlm.delete_cache(cache)
+            else:
+                answers, prompt_text, resp_text = vlm.call_gemini(frames, raw_event_qs, video_id)
+                governor.record_call(len(frames), prompt_text, resp_text)
+            video_answers.extend(answers)
         else:
-            handler = HANDLERS.get(r.handler)
-            try:
-                ans = handler(r, ctx)
-            except Exception as e:
-                ans = not_visible(qid, f"handler error: {type(e).__name__}")
-        record = {
-            "id": qid,
-            "answer": ans["answer"],
-            "confidence": round(float(ans.get("confidence", 0.3)), 2),
-            "evidence": [
-                {"video_id": vid, **{k: v for k, v in ev.items() if k != "video_id"}}
-                for ev in ans.get("evidence", [])
-            ],
-        }
-        if ans.get("reason"):
-            record["reason"] = ans["reason"]
-        answers.append(record)
-        per_question_logs.append(
-            {
-                "id": qid,
-                "video_id": vid,
-                "routed_handler": r.handler,
-                "declared_type": r.qtype,
-                "target_time": r.target_time,
-                "frames_used": len(budget.frame_records) - frame_start,
-                "frame_timestamps": [f.to_dict() for f in budget.frame_records[frame_start:]],
-                "model_calls_used": len(budget.calls) - call_start,
-                "model_calls": [c.to_dict() for c in budget.calls[call_start:]],
-            }
-        )
-    if store is not None:
-        store.close()
-    return answers, budget
+            video_answers.extend([
+                {"id": q["id"], "answer": "not_visible", "confidence": 0.0, "evidence": []}
+                for q in raw_event_qs
+            ])
+
+    # Strategy 3: OCR Detail (order number, tickets, screens)
+    ocr_group = grouped_qs.get("ocr_detail", [])
+    if ocr_group:
+        raw_ocr_qs = [item["raw"] for item in ocr_group]
+        print(f"  [Route: OCR Detail] Querying {len(raw_ocr_qs)} Qs for readable slips/screens")
+        # Check active counter moments at high resolution
+        candidate_ts = motion_info["activity_spikes"][:8] if motion_info["activity_spikes"] else [5.0, 10.0, 15.0, 20.0]
+        frames = extract_frames_at_timestamps(str(video_path), candidate_ts, max_width=1024)
+        if frames:
+            answers, prompt_text, resp_text = vlm.call_gemini(frames, raw_ocr_qs, video_id)
+            governor.record_call(len(frames), prompt_text, resp_text)
+            video_answers.extend(answers)
+        else:
+            video_answers.extend([
+                {"id": q["id"], "answer": "not_visible", "confidence": 0.0, "evidence": []}
+                for q in raw_ocr_qs
+            ])
+
+    # Strategy 4: General questions
+    general_group = grouped_qs.get("general", [])
+    if general_group:
+        raw_gen_qs = [item["raw"] for item in general_group]
+        print(f"  [Route: General] Querying {len(raw_gen_qs)} Qs with representative keyframes")
+        coarse_ts = [round(i * (duration_sec / 8.0), 2) for i in range(8)] if duration_sec > 0 else [0.0]
+        frames = extract_frames_at_timestamps(str(video_path), coarse_ts)
+        if frames:
+            answers, prompt_text, resp_text = vlm.call_gemini(frames, raw_gen_qs, video_id)
+            governor.record_call(len(frames), prompt_text, resp_text)
+            video_answers.extend(answers)
+        else:
+            video_answers.extend([
+                {"id": q["id"], "answer": "not_visible", "confidence": 0.0, "evidence": []}
+                for q in raw_gen_qs
+            ])
+
+    return video_answers
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Kitchen CCTV QA agent (builderr submission)")
-    ap.add_argument("--videos", default=None, help="directory of videos, single file, or URL")
-    ap.add_argument("--questions", default=None)
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--log", required=True)
-    ap.add_argument("--config", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml"))
-    ap.add_argument("--limit-minutes", type=float, default=None)
-    ap.add_argument("--download-only", action="store_true", help="fetch/load model weights then exit (pre-warm cache outside timed runs)")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser(description="Kitchen CCTV Monitor v2")
+    parser.add_argument("--videos", required=True, help="Path to videos directory")
+    parser.add_argument("--questions", required=True, help="Path to questions JSON file")
+    parser.add_argument("--out", required=True, help="Path to output answers JSON file")
+    parser.add_argument("--log", default=None, help="Path to output run log JSON file")
+    args = parser.parse_args()
 
-    state = {"questions": None}
-    try:
-        run(args, state)
-    except SystemExit:
-        raise
-    except Exception as e:
-        emergency_dump(args.out, args.log, state["questions"], e)
-    finally:
-        cleanup_cache()
+    videos_dir = Path(args.videos)
+    questions_file = Path(args.questions)
+    out_file = Path(args.out)
+    log_file = Path(args.log) if args.log else out_file.with_name("run_log.json")
 
+    if not questions_file.exists():
+        print(f"ERROR: Questions file not found: {questions_file}", file=sys.stderr)
+        sys.exit(1)
 
-def run(args, state):
-    cfg = load_cfg(args.config)
-    if args.limit_minutes:
-        cfg["budgets"]["wall_clock_minutes"] = args.limit_minutes
-    set_seed(int(cfg["runtime"].get("seed", 0)))
-    register_handlers()
+    with open(questions_file, "r") as f:
+        questions_data = json.load(f)
 
-    from agent.detector import Detector
-    from agent.io_utils import dump_json, load_json
-    from agent.vlm import VLM
+    # Initialize modular pipeline components
+    governor = CostGovernor()
+    vlm = VLMClient()
+    indexer = MotionIndexer()
 
-    if args.download_only:
-        detector = Detector(cfg, None)
-        vlm = VLM(cfg, None)
-        download_only(cfg, detector, vlm)
-        return
+    # Group questions by video_id
+    by_video: Dict[str, List[Dict[str, Any]]] = {}
+    for q in questions_data:
+        vid = q.get("video_id", "default")
+        by_video.setdefault(vid, []).append(q)
 
-    if not args.videos or not args.questions:
-        raise ValueError("--videos and --questions are required unless --download-only is used")
+    all_answers: List[Dict[str, Any]] = []
 
-    detector = Detector(cfg, None)
-    vlm = VLM(cfg, None)
-    questions = load_json(args.questions)
-    state["questions"] = questions
-    videos = discover_videos(args.videos)
-
-    # Load every declared model before the internal budget clock. This remains
-    # best-effort during a scored run so output is guaranteed; --download-only
-    # is the strict setup check and exits non-zero on an unavailable component.
-    warm_status = warm_models(cfg, detector, vlm)
-    unavailable = [
-        name for name in ("detector", "retriever", "vlm") if not warm_status[name]
-    ]
-    if unavailable:
-        print(
-            f"warn: model warm-up incomplete ({', '.join(unavailable)}); "
-            "unanswerable questions will degrade to not_visible",
-            file=sys.stderr,
-        )
-    t0 = time.perf_counter()
-    cache_parent = os.path.dirname(os.path.abspath(args.log))
-    os.makedirs(cache_parent, exist_ok=True)
-    run_cache_dir = os.path.join(
-        cache_parent, f".kitchen-cctv-cache-{os.getpid()}-{secrets.token_hex(3)}"
-    )
-    os.makedirs(run_cache_dir, exist_ok=False)
-    CACHE_DIRS.append(run_cache_dir)
-    cfg["sampling"] = dict(cfg["sampling"], cache_dir=run_cache_dir)
-
-    by_video = {}
-    for q in questions:
-        vid = q.get("video_id")
-        if vid and vid not in videos and len(videos) == 1:
-            by_video.setdefault(next(iter(videos)), []).append(q)
-        elif not vid and len(videos) >= 1:
-            by_video.setdefault(next(iter(videos)), []).append(q)
-        else:
-            by_video.setdefault(vid, []).append(q)
-
-    all_answers = []
-    per_question_logs = []
-    budgets = []
-
-    for vid, qs in by_video.items():
-        path = videos.get(vid)
-        if path is None:
-            for q in qs:
-                all_answers.append(
-                    {
-                        "id": q.get("id"),
-                        "answer": "not_visible",
-                        "confidence": 0.3,
-                        "evidence": [],
-                        "reason": f"video_id '{vid}' not found in supplied videos",
-                    }
-                )
-                per_question_logs.append(
-                    {"id": q.get("id"), "video_id": vid, "routed_handler": "unresolved_video"}
-                )
+    for vid, q_list in by_video.items():
+        vpath = resolve_video_path(videos_dir, vid)
+        if not vpath or not vpath.exists():
+            print(f"WARNING: Video '{vid}' not found in {videos_dir}. Returning 'not_visible' for {len(q_list)} questions.")
+            for q in q_list:
+                all_answers.append({
+                    "id": q["id"],
+                    "answer": "not_visible",
+                    "confidence": 0.0,
+                    "evidence": []
+                })
             continue
-        try:
-            if path.lower().startswith(("http://", "https://")):
-                path = resolve_url(path, run_cache_dir)
-        except Exception as e:
-            print(f"warn: cannot fetch {path}: {e}", file=sys.stderr)
-            for q in qs:
-                all_answers.append(
-                    {
-                        "id": q.get("id"),
-                        "answer": "not_visible",
-                        "confidence": 0.3,
-                        "evidence": [],
-                        "reason": "video download failed",
-                    }
-                )
-            continue
-        answers, budget = process_video(vid, path, qs, cfg, detector, vlm, t0, per_question_logs)
+
+        answers = process_video_questions(vpath, vid, q_list, vlm, governor, indexer)
         all_answers.extend(answers)
-        if budget is not None:
-            budgets.append(budget)
 
-    runtime = time.perf_counter() - t0
-    frames_total = sum(b.frames_processed for b in budgets)
-    calls_total = sum(len(b.calls) for b in budgets)
-    cost_total = sum(b.total_cost_usd for b in budgets)
-    duration_sum = sum(b.duration_seconds for b in budgets)
-    norm_cost = cost_total * (HOUR / duration_sum) if duration_sum > 0 else 0.0
-    wall_limit = float(cfg["budgets"]["wall_clock_minutes"]) * 60
+    # Ensure all original question IDs are present and in order
+    answer_map = {a["id"]: a for a in all_answers}
+    final_answers = []
+    for q in questions_data:
+        qid = q["id"]
+        if qid in answer_map:
+            final_answers.append(answer_map[qid])
+        else:
+            final_answers.append({
+                "id": qid,
+                "answer": "not_visible",
+                "confidence": 0.0,
+                "evidence": []
+            })
 
-    run_log = {
-        "runtime_seconds": round(runtime, 1),
-        "frames_processed": int(frames_total),
-        "model_calls": int(calls_total),
-        "vlm_calls": int(sum(b.vlm_calls for b in budgets)),
-        "estimated_model_api_cost_usd": round(cost_total, 6),
-        "normalized_model_api_cost_per_60min_usd": round(norm_cost, 6),
-        "within_caps": {
-            "runtime_under_global_limit": runtime <= wall_limit,
-            "frames_within_budget": all(b.frames_processed <= b.frame_cap for b in budgets),
-            "model_calls_within_budget": all(len(b.calls) <= b.calls_cap for b in budgets),
-            "cost_within_normalized_limit": norm_cost <= 0.30,
-            "local_models_only": True,
-        },
-        "caps": {
-            "frames_per_60min": cfg["budgets"]["frames_per_video_hour"],
-            "wall_clock_minutes_global": cfg["budgets"]["wall_clock_minutes"],
-            "max_model_calls": cfg["budgets"].get("max_model_calls", 400),
-            "cost_cap_per_60min_usd": 0.30,
-        },
-        "models": {
-            "detector": {"weights": cfg["models"]["detector"]["weights"], "available": detector.available},
-            "retriever": {
-                "model": cfg["models"].get("retriever", {}).get("model"),
-                "available": any(getattr(b, "semantic_available", False) for b in budgets),
-                "load_errors": [
-                    b.semantic_error for b in budgets if getattr(b, "semantic_error", None)
-                ],
-            },
-            "vlm": {
-                "primary": cfg["models"]["vlm"]["primary"],
-                "loaded_as": vlm.model_id if vlm.available else None,
-                "available": vlm.available,
-                "load_error": vlm.load_error,
-            },
-        },
-        "per_question": per_question_logs,
-        "frames": [
-            {"video_id": b.video_id, **frame.to_dict()}
-            for b in budgets
-            for frame in b.frame_records
-        ],
-        "calls": [
-            {"video_id": b.video_id, **call.to_dict()}
-            for b in budgets
-            for call in b.calls
-        ],
-        "seed": int(cfg["runtime"].get("seed", 0)),
-    }
-    run_log["valid_under_hard_caps"] = all(run_log["within_caps"].values())
-    dump_json(args.out, all_answers)
-    dump_json(args.log, run_log)
-    print(f"wrote {args.out} ({len(all_answers)} answers) and {args.log}")
+    # Ensure parent directory exists for output
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_file, "w") as f:
+        json.dump(final_answers, f, indent=2)
+
+    # Write official run log
+    run_log_data = governor.get_run_log()
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_file, "w") as f:
+        json.dump(run_log_data, f, indent=2)
+
+    print("\n" + "=" * 60)
+    print("AUDIT EXECUTION COMPLETE")
+    print("=" * 60)
+    print(f"  Answers written: {len(final_answers)} -> {out_file}")
+    print(f"  Run log written: {log_file}")
+    print(f"  Runtime:         {run_log_data['runtime_seconds']}s")
+    print(f"  Frames:          {run_log_data['frames_processed']}")
+    print(f"  Model Calls:     {run_log_data['model_calls']}")
+    print(f"  Est Cost:        ${run_log_data['estimated_model_api_cost_usd']}")
+    print(f"  Norm Cost/60m:   ${run_log_data['normalized_model_api_cost_per_60min_usd']} (Cap: $0.30)")
+    print(f"  Budget Status:   {run_log_data['budget_status']}")
+    print("=" * 60 + "\n")
 
 
 if __name__ == "__main__":

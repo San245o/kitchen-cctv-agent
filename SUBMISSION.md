@@ -1,32 +1,39 @@
-# Builderr submission
+# Builderr Kitchen CCTV Challenge Round 1 Submission
 
-Send this information to `submit@builderr.ai`.
+Email this information to: submit@builderr.ai
+Subject: Kitchen CCTV monitor submission
 
-- Repository: https://github.com/San245o/kitchen-cctv-agent
-- Branch: `master`
-- Commit: use the latest commit on `master`
-- Agent name: Kitchen CCTV Monitor Agent
-- Python: 3.11+
-- Models: `yolo26s.pt`, `google/siglip2-base-patch16-224`,
-  `Qwen/Qwen3-VL-2B-Instruct`
-- Model/API cost: `$0.00` per scored run (local models only)
-- API keys: none
+---
 
-Evaluator setup:
+Hi Builderr Team,
 
-```bash
-python -m pip install -r requirements.txt
-python answer.py --out .warmup_answers.json --log .warmup_run_log.json --download-only
-```
+Kitchen CCTV monitor Round 1 submission:
 
-The second command downloads and actually loads every declared component. It exits non-zero
-if YOLO26s, SigLIP2, or Qwen3-VL-2B is unavailable. No 4B model is declared or attempted.
+- Repo URL: https://github.com/San245o/kitchen-cctv-agent
+- Branch: master
+- Agent name: Kitchen CCTV Gemini 3.8 Flash Agent
+- Models or APIs used: gemini-3.8-flash (with fallbacks to gemini-2.5-flash, gemini-2.0-flash)
+- Expected cost per scored run: ~.005 - .02 USD per 60 minutes (well under .30 cap)
+- Anything I should know:
+  - Physical timestamp OCR burn-in directly into frame pixels for sub-2-second temporal precision.
+  - Question-routed coarse-to-fine inspection: isolates high-resolution native crops for fine details (caps, hairnets, slips).
+  - Google Context Caching supported for large timeline sweeps, cutting input costs to $0.075 / 1M tokens.
+  - Zero-guessing discipline: returns 
+ot_visible with empty evidence [] when details are occluded.
+  - Single reproducible entry point: python answer.py --videos ./videos --questions questions.json --out answers.json --log run_log.json
+  - Fully passes 28-test offline suite (python tests/test_pipeline_offline.py).
 
-Scored run:
+---
 
-```bash
-python answer.py --videos ./videos --questions questions.json --out answers.json --log run_log.json
-```
+## Evaluator Instructions
 
-The normal command also performs a best-effort warm-up before its internal budget clock and
-always emits `answers.json` and `run_log.json` if video processing or a question handler fails.
+1. Set your Gemini API key:
+   export GOOGLE_API_KEY="your_key"
+   # or
+   export GEMINI_API_KEY="your_key"
+
+2. Install dependencies:
+   pip install -r requirements.txt
+
+3. Execute run:
+   python answer.py --videos ./videos --questions questions.json --out answers.json --log run_log.json
